@@ -4,6 +4,14 @@ This file captures project context, architectural decisions, and active plans so
 
 ---
 
+## Repository layout note (read first if you're external)
+
+`sable-roles` is one of several repos in the Sable tool stack. This file was written for the maintainer's local environment and references absolute paths like `~/Projects/SablePlatform/...` and `~/Projects/SolStitch/internal/...`. **Those are Sable-internal repos and documents — they are not part of this GitHub repository.**
+
+The one dependency that genuinely matters for understanding the code is **SablePlatform** (the bot imports `sable_platform.db.*`). Its full surface — the six symbols and one table this bot uses — is specified self-contained in [`docs/SABLEPLATFORM_CONTRACT.md`](docs/SABLEPLATFORM_CONTRACT.md). When this file points at a `~/Projects/SablePlatform/...` file, that contract doc is the in-repo substitute. The other `~/Projects/...` references (build plan, ship runbook) are design-history context that lives outside this repo by design; the code plus this file plus the contract doc is the complete picture for review.
+
+---
+
 ## What this is
 
 A dedicated Discord bot for **Sable's community-role automation across client servers**. V1 ships fit-check streak tracking + image-only enforcement for SolStitch's `#fitcheck`. Future features (e.g. `@influenza` monthly rotation, role-tier grants tied to points) plug into the same bot process.
