@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sable-roles"
+version = "0.1.0"
+description = "Sable Discord bot: fit-check streak enforcement + future role rotations"
+requires-python = ">=3.11"
+dependencies = [
+    "discord.py>=2.7",
+    "python-dotenv",
+    "pytest",
+    "pytest-asyncio",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sable_roles*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

@@ -1,0 +1,28 @@
+# Secrets — NEVER commit. The Discord bot token lives in .env.
+.env
+.env.local
+.env.*.local
+*.token
+*.secret
+secrets/
+# .env.example IS tracked on purpose — it's a no-real-values template.
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+
+# OS / editor
+.DS_Store
+*.swp
+
+# Local runtime artifacts
+.fitcheck.live.log
+*.live.log
