@@ -15,6 +15,7 @@ For project context: `CLAUDE.md` / `AGENTS.md`. For the build plan: `~/Projects/
 | Check bot is running (local) | `pgrep -fa sable_roles.main` or `tmux ls \| grep sable-roles` |
 | Tail the live log | `tail -f ~/Projects/sable-roles/.fitcheck.live.log` |
 | Verify `/streak` works | Run `/streak` in any SolStitch channel — bot replies ephemerally |
+| Pause enforcement (mod-only) | Run `/relax-mode mode:on` — text-only allowed in `#fitcheck`, no auto-threading. `/relax-mode mode:off` resumes. Mod role from `SABLE_ROLES_MOD_ROLES_JSON` required. |
 | Recent fits across all orgs | `sqlite3 ~/.sable/sable.db "SELECT counted_for_day, org_id, user_id FROM discord_streak_events ORDER BY id DESC LIMIT 20;"` |
 | Recent enforcement actions | `sqlite3 ~/.sable/sable.db "SELECT created_at, action, json_extract(detail,'$.dm_success') FROM audit_log WHERE source='sable-roles' ORDER BY id DESC LIMIT 20;"` |
 | Restart bot (local tmux) | `tmux kill-session -t sable-roles && tmux new -d -s sable-roles 'cd ~/Projects/sable-roles && .venv/bin/python -m sable_roles.main 2>&1 \| tee ~/Projects/sable-roles/.fitcheck.live.log'` |

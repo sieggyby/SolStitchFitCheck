@@ -27,6 +27,15 @@ GUILD_TO_ORG: dict = json.loads(
 HEALTH_CHANNELS: dict = json.loads(
     os.environ.get("SABLE_ROLES_HEALTH_CHANNELS_JSON", "{}")
 )
+# Per-guild list of role IDs whose holders count as "mods" for mod-only slash
+# commands like /relax-mode and (V2) /set-burn-mode + /burn-me @user. Shape:
+#   {"<guild_id>": ["<role_id>", ...]}
+# Roles are role IDs (strings). Discord's built-in Administrator permission
+# does NOT auto-grant mod status here — Brian (@Atelier admin) is only a mod
+# if his role is explicitly in this list. Decoupled by design.
+MOD_ROLES: dict = json.loads(
+    os.environ.get("SABLE_ROLES_MOD_ROLES_JSON", "{}")
+)
 
 DM_BANK: list[str] = [
     "images do the talking in here — yours got returned to sender. drop a fit or hop into a thread.",

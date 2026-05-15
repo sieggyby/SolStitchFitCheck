@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 import discord
 from discord import app_commands
 
-from sable_platform.db import discord_streaks
+from sable_platform.db import discord_guild_config, discord_streaks
 from sable_platform.db.audit import log_audit
 from sable_platform.db.connection import get_db
 
@@ -35,6 +35,7 @@ from sable_roles.config import (
     FITCHECK_CHANNELS,
     GUILD_TO_ORG,
     IMAGE_EXT_ALLOWLIST,
+    MOD_ROLES,
 )
 
 logger = logging.getLogger("sable_roles.fitcheck_streak")
@@ -60,6 +61,21 @@ def _is_fitcheck_channel(channel_id: int) -> bool:
 
 def _guild_for(channel_id: int) -> str | None:
     return _CHANNEL_TO_GUILD.get(channel_id)
+
+
+def _is_mod(member: discord.Member, guild_id: str) -> bool:
+    """True if the member holds any role in MOD_ROLES[guild_id].
+
+    Discord's Administrator permission does NOT auto-grant mod status — the
+    role must be explicitly listed in `SABLE_ROLES_MOD_ROLES_JSON` for the
+    member to pass this check. Decoupled from Discord role hierarchy on
+    purpose so Brian-as-@Atelier-admin isn't an automatic mod for V2 ops.
+    """
+    mod_role_ids = {str(rid) for rid in MOD_ROLES.get(guild_id, [])}
+    if not mod_role_ids:
+        return False
+    member_role_ids = {str(role.id) for role in member.roles}
+    return bool(member_role_ids & mod_role_ids)
 
 
 def is_image(att: discord.Attachment) -> bool:
@@ -99,6 +115,13 @@ async def on_message(message: discord.Message) -> None:
     if channel.id != fitcheck_channel_id:
         return
 
+    # Read the per-guild relax-mode toggle once. When on: image branch still
+    # credits the streak + reacts 🔥 but skips auto-threading; text branch
+    # skips delete+DM entirely. Off (default) preserves V1 enforcement.
+    with get_db() as conn:
+        guild_cfg = discord_guild_config.get_config(conn, guild_id)
+    relax_mode_on = bool(guild_cfg["relax_mode_on"])
+
     has_image = any(is_image(att) for att in message.attachments)
 
     if has_image:
@@ -127,6 +150,9 @@ async def on_message(message: discord.Message) -> None:
             logger.warning(
                 "add_reaction failed for post %s", message.id, exc_info=exc
             )
+
+        if relax_mode_on:
+            return  # streak credit + 🔥 stand; auto-threading skipped in relax mode
 
         thread_name = f"{message.author.display_name} · {counted_for_day}"[:100]
         try:
@@ -157,6 +183,10 @@ async def on_message(message: discord.Message) -> None:
                     source="sable-roles",
                 )
         return
+
+    # text branch
+    if relax_mode_on:
+        return  # text allowed; no delete + no DM
 
     user_id = message.author.id
     now = datetime.now(timezone.utc)
@@ -355,6 +385,64 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         await interaction.followup.send(
             _format_streak(state, interaction.guild_id), ephemeral=True
         )
+
+    @tree.command(
+        name="relax-mode",
+        description="(mods) Toggle fit-check enforcement relaxation on/off",
+    )
+    @app_commands.describe(mode="on or off")
+    @app_commands.choices(
+        mode=[
+            app_commands.Choice(name="on", value="on"),
+            app_commands.Choice(name="off", value="off"),
+        ]
+    )
+    async def relax_mode(
+        interaction: discord.Interaction,
+        mode: app_commands.Choice[str],
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+        guild_id = str(interaction.guild_id) if interaction.guild_id else None
+        org_id = GUILD_TO_ORG.get(guild_id) if guild_id else None
+        if guild_id is None or org_id is None:
+            await interaction.followup.send(
+                "not configured for this server.", ephemeral=True
+            )
+            return
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.followup.send(
+                "this command must be run inside the server.", ephemeral=True
+            )
+            return
+        if not _is_mod(interaction.user, guild_id):
+            await interaction.followup.send(
+                "you're not a mod.", ephemeral=True
+            )
+            return
+        on = mode.value == "on"
+        with get_db() as conn:
+            discord_guild_config.set_relax_mode(
+                conn, guild_id, on=on, updated_by=str(interaction.user.id)
+            )
+            log_audit(
+                conn,
+                actor=f"discord:user:{interaction.user.id}",
+                action="fitcheck_relax_mode_toggled",
+                org_id=org_id,
+                entity_id=None,
+                detail={
+                    "guild_id": guild_id,
+                    "on": on,
+                    "by_user_id": str(interaction.user.id),
+                },
+                source="sable-roles",
+            )
+        body = (
+            "relax-mode **on** — text allowed, no auto-threading. enforcement paused."
+            if on
+            else "relax-mode **off** — normal enforcement restored."
+        )
+        await interaction.followup.send(body, ephemeral=True)
 
 
 async def close() -> None:

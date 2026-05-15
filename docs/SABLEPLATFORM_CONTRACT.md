@@ -17,12 +17,12 @@ Every `sable_platform` import in this repo:
 from sable_platform.db.connection import get_db
 
 # sable_roles/features/fitcheck_streak.py
-from sable_platform.db import discord_streaks
+from sable_platform.db import discord_guild_config, discord_streaks
 from sable_platform.db.audit import log_audit
 from sable_platform.db.connection import get_db
 ```
 
-That's it. Three modules: `sable_platform.db.connection`, `sable_platform.db.discord_streaks`, `sable_platform.db.audit`.
+That's it. Four modules: `sable_platform.db.connection`, `sable_platform.db.discord_streaks`, `sable_platform.db.discord_guild_config`, `sable_platform.db.audit`.
 
 ---
 
@@ -127,6 +127,36 @@ Computes streak state app-side by iterating distinct `counted_for_day` values. O
 
 ---
 
+## 3b. `sable_platform.db.discord_guild_config` (V2 — relax-mode + burn-me)
+
+Three functions. Per-guild config table — one row per configured guild, created lazily by the first mod toggle.
+
+### `get_config`
+
+```python
+def get_config(conn: Connection, guild_id: str) -> dict
+```
+
+Returns a dict with keys: `guild_id`, `relax_mode_on` (int 0|1), `current_burn_mode` (str, "once"|"persist"), `updated_at` (str|None), `updated_by` (str|None). For unconfigured guilds, returns defaults (`relax_mode_on=0`, `current_burn_mode="once"`, `updated_at=None`, `updated_by=None`) — does not insert a row.
+
+### `set_relax_mode`
+
+```python
+def set_relax_mode(conn: Connection, guild_id: str, on: bool, updated_by: str) -> None
+```
+
+Upserts `relax_mode_on` for a guild. On conflict, only `relax_mode_on`, `updated_at`, and `updated_by` change; `current_burn_mode` is preserved. Called by `/relax-mode` mod-only slash command.
+
+### `set_burn_mode`
+
+```python
+def set_burn_mode(conn: Connection, guild_id: str, mode: str, updated_by: str) -> None
+```
+
+Upserts `current_burn_mode` for a guild. `mode` must be `"once"` or `"persist"` (raises `ValueError` otherwise). On conflict, only `current_burn_mode`, `updated_at`, and `updated_by` change; `relax_mode_on` is preserved. Reserved for the V2 burn-me feature; the interface ships now so the schema is stable.
+
+---
+
 ## 4. `sable_platform.db.audit.log_audit`
 
 ```python
@@ -158,13 +188,17 @@ log_audit(
 )
 ```
 
-Actions this bot writes: `fitcheck_text_message_deleted`, `fitcheck_thread_create_failed`. Both with `source="sable-roles"` and `actor="discord:bot:<bot_user_id>"`.
+Actions this bot writes (V1): `fitcheck_text_message_deleted`, `fitcheck_thread_create_failed` — both with `source="sable-roles"` and `actor="discord:bot:<bot_user_id>"`.
+
+V2 adds: `fitcheck_relax_mode_toggled` — written by `/relax-mode`, with `source="sable-roles"` and `actor="discord:user:<invoking_user_id>"` (a real Discord user toggled it, not the bot).
 
 `audit_log` table columns the insert targets: `actor`, `action`, `org_id`, `entity_id`, `detail_json`, `source` (plus an autoincrement `id` and a timestamp default — both owned by SablePlatform's schema).
 
 ---
 
-## 5. Table: `discord_streak_events` (migration 043)
+## 5. Tables
+
+### `discord_streak_events` (migration 043)
 
 Owned by SablePlatform — `sable_platform/db/migrations/043_discord_streak_events.sql` + a matching Alembic revision for Postgres. `sable-roles` never issues raw DDL; it only goes through the helpers in §3.
 
@@ -205,6 +239,25 @@ CREATE INDEX IF NOT EXISTS idx_discord_streak_events_user_reactions
 - `counts_for_streak`, `invalidated_at`, `invalidated_reason` — moderation-only. Set by an operator (raw SQL or a future admin CLI), never by the bot's runtime path. `compute_streak_state` filters on `counts_for_streak = 1 AND invalidated_at IS NULL`.
 - `posted_at`, `counted_for_day`, `user_id` — immutable post facts. Written once on first insert.
 - `updated_at` — the optimistic-lock token. Bumped on every `upsert_streak_event` conflict and every `update_reaction_score`.
+
+### `discord_guild_config` (migration 045)
+
+```sql
+CREATE TABLE IF NOT EXISTS discord_guild_config (
+    guild_id          TEXT PRIMARY KEY,
+    relax_mode_on     INTEGER NOT NULL DEFAULT 0,
+    current_burn_mode TEXT NOT NULL DEFAULT 'once',
+    updated_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_by        TEXT NOT NULL
+);
+```
+
+One row per configured guild, created lazily by the first mod toggle. Rows never deleted; toggles upsert.
+
+**Column ownership / mutation rules:**
+- `relax_mode_on` — owned exclusively by `set_relax_mode`. Preserved on `set_burn_mode` conflict.
+- `current_burn_mode` — owned exclusively by `set_burn_mode`. Preserved on `set_relax_mode` conflict. Values constrained to `{"once", "persist"}` by the helper (no DB-level CHECK).
+- `updated_at`, `updated_by` — bumped on every helper call. `updated_by` is the Discord user ID of the invoking mod.
 
 ---
 
