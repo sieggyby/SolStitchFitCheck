@@ -333,41 +333,57 @@ Per build plan §15 migration sequence. Sequence to follow when bringing
 
 ---
 
-## 8. VPS deployment plan (PENDING — target 24-48h post-go-live)
+## 8. VPS deployment (DONE — 2026-05-16)
 
-V1 currently runs on Sieggy's local machine. The build plan §6 calls for VPS deployment within 24-48h. The Hetzner VPS already hosts SablePlatform's Docker stack — `sable-roles` should live there.
+Stitzy ships as a compose service inside the existing `sable-web` Docker project on the Hetzner CPX11 at `178.156.204.125`. SablePlatform migrations 042-048 + the sable-roles V2 code stack all landed in the same session — that work is captured in SP commit `acc52e2` and sable-roles commit `2ecd892`.
 
-### Proposed compose addition
+### Deployed shape
 
-```yaml
-# sableplatform/compose.yaml — add this service
-services:
-  sable-roles:
-    build: ../sable-roles    # or pull from a future image registry
-    restart: unless-stopped
-    environment:
-      SABLE_ROLES_DISCORD_TOKEN: ${SABLE_ROLES_DISCORD_TOKEN}
-      SABLE_ROLES_FITCHECK_CHANNELS_JSON: ${SABLE_ROLES_FITCHECK_CHANNELS_JSON}
-      SABLE_ROLES_GUILD_TO_ORG_JSON: ${SABLE_ROLES_GUILD_TO_ORG_JSON}
-      SABLE_ROLES_HEALTH_CHANNELS_JSON: ${SABLE_ROLES_HEALTH_CHANNELS_JSON:-{}}
-      SABLE_DATABASE_URL: ${SABLE_DATABASE_URL}    # share SP's Postgres
-    depends_on:
-      - postgres
+| Piece | Value |
+|---|---|
+| VPS | Hetzner CPX11 (2 vCPU / 2 GB RAM / 40 GB) at `178.156.204.125`, Ubuntu 24.04 |
+| Compose project | `sable-web` at `/opt/sable-web/` |
+| Service name | `sable-roles` (container: `sable-web-sable-roles-1`) |
+| Image tag | `stitzy:latest` (218 MB; built locally on the box, not pushed to a registry) |
+| DB | Production Postgres 16 on host. Bot uses `host.docker.internal:5432` (resolved via `extra_hosts: host-gateway`; pg_hba allows `sable` role from `172.18.0.0/16`). |
+| Env file | `/opt/sable-web/.env` — `SABLE_ROLES_DATABASE_URL` plus all `SABLE_ROLES_*` plus `ANTHROPIC_API_KEY` appended 2026-05-16 |
+| Resident memory | ~72 MiB (well under the projected 200 MB headroom budget) |
+| Restart policy | `unless-stopped` (no healthcheck — bot is gateway-only, discord.py reconnects internally) |
+
+### Build + (re)deploy
+
+```bash
+# On the VPS, as root:
+# 1. Pull latest source
+cd /opt/sable/sable-roles && sudo -u sable git pull origin main
+# (also pull SP if it changed: cd /opt/sable/platform && sudo -u sable git pull origin main)
+
+# 2. Apply any new SP migrations (only when SP is bumped)
+cd /opt/sable/platform
+export SABLE_DATABASE_URL="$(grep -E '^SABLE_DATABASE_URL=' /opt/sable/.env | head -1 | cut -d= -f2-)"
+/opt/sable/venv/bin/alembic upgrade head
+
+# 3. Rebuild image — context is /opt/sable so SablePlatform symlink resolves
+cd /opt/sable && docker build -f sable-roles/Dockerfile -t stitzy:latest .
+
+# 4. Recreate container
+cd /opt/sable-web && docker compose up -d sable-roles
 ```
 
-### Pre-deploy checklist
+### Why container env uses `host.docker.internal` (load-bearing)
 
-1. Add a `Dockerfile` to `~/Projects/sable-roles/` (~5 lines: python:3.11-slim + pip install -e . + pip install -e /SablePlatform + CMD `python -m sable_roles.main`).
-2. Mount SablePlatform's volume so `pip install -e ../SablePlatform` resolves (or use a multi-stage build that pip-installs from the host path).
-3. Set `SABLE_ROLES_*` env vars in the VPS's compose `.env`. The Discord token is one-per-deployment — sharing the prod token across local + VPS means whichever boots last wins gateway (one Discord session per token). **Run only on VPS** after deploy; stop the local tmux process.
-4. Verify migration 043 has applied to the Postgres instance (`SELECT version_num FROM alembic_version;` should show `b2da0d6b1be1`).
-5. Smoke: run `/streak` in SolStitch after VPS boot. Should respond from the VPS process. Verify by tailing VPS logs (`docker compose logs -f sable-roles`).
+The host `/opt/sable/.env` uses `SABLE_DATABASE_URL=postgresql://...@127.0.0.1:5432/sable` (works for alembic + host CLIs). That URL is unreachable from inside any container — 127.0.0.1 there is the container's own loopback. The compose override sets `extra_hosts: host.docker.internal:host-gateway` and the bot env points at `host.docker.internal`, which resolves to the compose bridge gateway (172.18.0.1). Postgres is bound to that bridge IP and `pg_hba.conf` allows the `sable` role from `172.18.0.0/16`. Keep these three pieces in sync if the bridge subnet ever changes.
 
-### Post-deploy cleanup
+### Pre-flight notes for future redeploys
 
-- Stop the local tmux process: `tmux kill-session -t sable-roles`.
-- Update memory `project_solstitch_fitcheck` with the VPS deploy date.
-- Add `sable-roles` to whatever Hetzner monitoring SablePlatform already has (uptime check on the bot process).
+1. **SP working-tree gotcha:** migrations 042-048 were uncommitted on the laptop at the time of the initial deploy. Always commit-push-pull SP first before adjusting alembic, or you'll be applying migrations that don't exist on disk. See SP commit message for `acc52e2`.
+2. **SableWeb container shared the same compose project** — three fixes landed in the same override (next_cache named volume, `HOSTNAME=0.0.0.0`, healthcheck `127.0.0.1` instead of `localhost`). See `/opt/sable-web/docker-compose.override.yml` for the comment block explaining each.
+3. **Bot intent toggles** (Members + Message Content) are set in the Discord developer portal on the `Sable Roles` app — image rebuild does not change them.
+
+### Post-deploy hygiene
+
+- `OPERATIONS_RUNBOOK.md` §8 + §11 updated (this section + restart pattern below).
+- Memory: see `project_stitzy_vps_deployed` for the deploy-date-specific summary.
 
 ---
 
@@ -481,10 +497,12 @@ ORDER BY id DESC LIMIT 20;
 ### Emergency kill switch
 
 ```bash
-# Edit .env
+# Edit /opt/sable-web/.env on the VPS
 SABLE_ROLES_AIRLOCK_ENABLED=false
-# Then restart
-pkill -f sable_roles.main && cd ~/Projects/sable-roles && nohup .venv/bin/python -m sable_roles.main >> /tmp/sable_roles.log 2>&1 & disown
+# Then restart the container
+cd /opt/sable-web && docker compose restart sable-roles
+# Confirm
+docker compose logs --tail 5 sable-roles
 ```
 
 New joiners after the restart bypass airlock entirely. Existing
@@ -494,7 +512,7 @@ resume normal operation.
 
 ### Common ops
 
-- **Force re-snapshot of invites**: `pkill -f sable_roles.main` + restart. `on_ready → airlock.bootstrap()` re-fetches `guild.invites()`.
+- **Force re-snapshot of invites**: `docker compose restart sable-roles` from `/opt/sable-web/`. `on_ready → airlock.bootstrap()` re-fetches `guild.invites()` on each gateway connect.
 - **Add a team-inviter at runtime**: mod (team-tier) runs `/add-team-inviter @user` in SolStitch. Persists to `discord_team_inviters`, no restart.
 - **List team-inviters**: mod runs `/list-team-inviters` — ephemeral.
 - **Inspect a user's airlock state**: mod runs `/airlock-status @user` — ephemeral with attribution + decision history.
