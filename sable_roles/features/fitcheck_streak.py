@@ -151,37 +151,58 @@ async def on_message(message: discord.Message) -> None:
                 "add_reaction failed for post %s", message.id, exc_info=exc
             )
 
-        if relax_mode_on:
-            return  # streak credit + 🔥 stand; auto-threading skipped in relax mode
-
-        thread_name = f"{message.author.display_name} · {counted_for_day}"[:100]
-        try:
-            await message.create_thread(name=thread_name)
-        except discord.HTTPException as exc:
-            logger.warning(
-                "create_thread failed for post %s", message.id, exc_info=exc
-            )
-            bot_user = _client.user if _client is not None else None
-            actor = (
-                f"discord:bot:{bot_user.id}"
-                if bot_user is not None
-                else "discord:bot:unknown"
-            )
-            with get_db() as conn:
-                log_audit(
-                    conn,
-                    actor=actor,
-                    action="fitcheck_thread_create_failed",
-                    org_id=org_id,
-                    entity_id=None,
-                    detail={
-                        "guild_id": guild_id,
-                        "channel_id": str(channel.id),
-                        "post_id": str(message.id),
-                        "error": str(exc),
-                    },
-                    source="sable-roles",
+        if not relax_mode_on:
+            thread_name = f"{message.author.display_name} · {counted_for_day}"[:100]
+            try:
+                await message.create_thread(name=thread_name)
+            except discord.HTTPException as exc:
+                logger.warning(
+                    "create_thread failed for post %s", message.id, exc_info=exc
                 )
+                bot_user = _client.user if _client is not None else None
+                actor = (
+                    f"discord:bot:{bot_user.id}"
+                    if bot_user is not None
+                    else "discord:bot:unknown"
+                )
+                with get_db() as conn:
+                    log_audit(
+                        conn,
+                        actor=actor,
+                        action="fitcheck_thread_create_failed",
+                        org_id=org_id,
+                        entity_id=None,
+                        detail={
+                            "guild_id": guild_id,
+                            "channel_id": str(channel.id),
+                            "post_id": str(message.id),
+                            "error": str(exc),
+                        },
+                        source="sable-roles",
+                    )
+
+        # Burn-me hook: orthogonal to relax-mode — fires in both branches.
+        # asyncio.create_task so the Anthropic vision call doesn't block
+        # on_message return. Inline import avoids the circular dep (burn_me
+        # imports _is_mod + is_image from this module).
+        from sable_roles.features import burn_me as bm
+        asyncio.create_task(
+            bm.maybe_roast(message=message, org_id=org_id, guild_id=guild_id)
+        )
+
+        # R8: streak-restoration hook. Fires per-image-post (cheap — only
+        # one SP read + one SP write when current_streak==7 AND no row for
+        # this (guild,user,year_month,'streak_restoration')). Inline import
+        # mirrors the burn_me dispatch to keep import order resilient.
+        from sable_roles.features import roast as _roast
+        asyncio.create_task(
+            _roast.maybe_grant_restoration_token(
+                client=_client,
+                user_id=str(message.author.id),
+                guild_id=guild_id,
+                org_id=org_id,
+            )
+        )
         return
 
     # text branch

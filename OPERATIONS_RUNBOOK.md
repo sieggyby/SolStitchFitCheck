@@ -33,9 +33,9 @@ cd ~/Projects/sable-roles
 .venv/bin/python -c 'from dotenv import dotenv_values; import json; v=dotenv_values(".env"); j1=json.loads(v["SABLE_ROLES_FITCHECK_CHANNELS_JSON"]); j2=json.loads(v["SABLE_ROLES_GUILD_TO_ORG_JSON"]); print("env ok:", list(j1.keys()), list(j2.values()))'
 # Must print env ok with the expected guild + org values.
 
-# 2. Migration 043 applied (sanity)
+# 2. Migration 047 applied (R0-R11 ship: burn-me + /roast peer economy + vibe layer)
 sqlite3 ~/.sable/sable.db "SELECT MAX(version) FROM schema_version;"
-# Must return >= 43.
+# Must return >= 47.
 
 # 3. No competing process
 pgrep -fa sable_roles.main
@@ -200,7 +200,140 @@ After a force-kill, on next boot you may see `no events in last 24h` warning fro
 
 ---
 
-## 6. VPS deployment plan (PENDING — target 24-48h post-go-live)
+## 5.5 Roast feature env validation (R12)
+
+Run before announcing /roast in any client server. Augments §2.1.
+
+```bash
+cd ~/Projects/sable-roles
+.venv/bin/python -c "
+from sable_roles.config import (
+    PEER_ROAST_ROLES, PERSONALIZE_ADMINS, OBSERVATION_CHANNELS,
+    VIBE_INFERENCE_INTERVAL_DAYS, VIBE_INFERENCE_MODEL,
+    VIBE_OBSERVATION_WINDOW_DAYS, VIBE_OBSERVATION_ENABLED,
+    GUILD_TO_ORG,
+)
+gid = next(iter(GUILD_TO_ORG))
+assert PEER_ROAST_ROLES.get(gid), f'PEER_ROAST_ROLES missing for guild {gid}'
+assert PERSONALIZE_ADMINS.get(gid), f'PERSONALIZE_ADMINS missing for guild {gid}'
+print('roast env ok:', {
+    'peer_roles': len(PEER_ROAST_ROLES[gid]),
+    'admins': len(PERSONALIZE_ADMINS[gid]),
+    'obs_channels': OBSERVATION_CHANNELS.get(gid, '(all readable)'),
+    'inference_days': VIBE_INFERENCE_INTERVAL_DAYS,
+    'window_days': VIBE_OBSERVATION_WINDOW_DAYS,
+    'obs_enabled': VIBE_OBSERVATION_ENABLED,
+})
+"
+
+# Schema at 47
+sqlite3 ~/.sable/sable.db "SELECT MAX(version) FROM schema_version;"
+# → 47
+
+# All 6 mig 047 tables present
+sqlite3 ~/.sable/sable.db ".tables" \
+  | grep -oE "discord_(burn_blocklist|peer_roast_tokens|peer_roast_flags|message_observations|user_observations|user_vibes)"
+# → all 6 must appear
+```
+
+If any line fails: STOP. Don't announce until env is validated; an empty
+`PEER_ROAST_ROLES` mapping silently makes peer /roast inaccessible to
+every member.
+
+---
+
+## 6. Vibe-inference cron + observation pipeline (R10/R11)
+
+The observation pipeline runs silently as soon as the bot boots; it
+captures messages + reactions across `OBSERVATION_CHANNELS` (empty
+list = all readable text channels). The inference cron fires weekly
+(or whatever `VIBE_INFERENCE_INTERVAL_DAYS` is set to). Both halves
+respect the `VIBE_OBSERVATION_ENABLED` env kill switch and the
+per-guild `personalize_mode_on` toggle.
+
+### Healthy cron telemetry
+
+```bash
+# Observation pipeline activity in last 24h (raw message rows)
+sqlite3 ~/.sable/sable.db "
+SELECT COUNT(*) AS rows, COUNT(DISTINCT user_id) AS distinct_users
+FROM discord_message_observations
+WHERE captured_at > datetime('now', '-1 day');
+"
+
+# Inference cost over last 7 days (per org)
+sqlite3 ~/.sable/sable.db "
+SELECT org_id, ROUND(SUM(cost_usd), 4) AS spend, COUNT(*) AS calls
+FROM cost_events
+WHERE call_type = 'sable_roles_vibe_infer'
+  AND created_at > datetime('now', '-7 days')
+GROUP BY org_id;
+"
+# Plan §0.3 budget cap: ~$0.15-0.25/wk per guild. Above that means
+# either inference is firing too often or a guild has 500+ active users.
+
+# Inference rejections (validation failures, refused payloads)
+sqlite3 ~/.sable/sable.db "
+SELECT COUNT(*) AS refused
+FROM cost_events
+WHERE call_type = 'sable_roles_vibe_infer' AND call_status = 'refused'
+  AND created_at > datetime('now', '-7 days');
+"
+# Spike in `refused` → adversarial input or model drift; investigate.
+```
+
+### Forcing a manual inference pass (debug)
+
+```bash
+cd ~/Projects/sable-roles
+.venv/bin/python -c "
+import asyncio
+from sable_roles.features import vibe_observer
+asyncio.run(vibe_observer._inference_pass())
+"
+```
+
+This honors the kill switch + per-guild toggle just like the cron tick.
+Useful for debugging or after a personalize-mode flip when you don't
+want to wait for the next weekly cycle.
+
+### Disabling the entire observation pipeline (emergency)
+
+```bash
+# Add to .env, then restart
+SABLE_ROLES_VIBE_OBSERVATION_ENABLED=false
+```
+
+This short-circuits the listener writes, the daily rollup, the GC,
+AND the inference cron. Data already in the tables is preserved.
+
+---
+
+## 7. Pin/announce sequence for new feature launch
+
+Per build plan §15 migration sequence. Sequence to follow when bringing
+/roast live in a new server (or re-launching after a major change):
+
+1. Verify env (§5.5 above).
+2. Pin canonical mechanic message in #fitcheck (paste contents of
+   `PINNED_FITCHECK_MESSAGE.md` verbatim, then Pin Message via the
+   message context menu — needs Manage Messages).
+3. Walk the 28-scenario smoke matrix in `SMOKE_TEST_ROAST.md`. Anything
+   red → DO NOT proceed.
+4. Let observation pipeline run silently 2-3 weeks. No user-visible
+   changes; vibes accumulate quietly.
+5. Post #announcements: "we added /roast — see the pin in #fitcheck for
+   how it works. peer-roast tokens are live; personalization comes
+   online next week."
+6. Admin runs `/set-personalize-mode mode:on` for the guild. Feature is
+   fully live.
+7. Monitor `cost_events` for the first 48h post-toggle (§6 telemetry).
+8. Iterate prompt + caps in `roast_v1_v2_personalization_plan.md` based
+   on observed roasts; revisit after the first month of data.
+
+---
+
+## 8. VPS deployment plan (PENDING — target 24-48h post-go-live)
 
 V1 currently runs on Sieggy's local machine. The build plan §6 calls for VPS deployment within 24-48h. The Hetzner VPS already hosts SablePlatform's Docker stack — `sable-roles` should live there.
 
@@ -238,7 +371,7 @@ services:
 
 ---
 
-## 7. Rollback (per plan §9)
+## 9. Rollback (per plan §12)
 
 If the bot misbehaves in production (deletes wrong messages, DMs wrong people, infinite-loops):
 
@@ -277,7 +410,7 @@ SQL
 
 ---
 
-## 8. Troubleshooting quick-ref
+## 10. Troubleshooting quick-ref
 
 | Issue | Diagnosis | Fix |
 |---|---|---|
@@ -292,7 +425,94 @@ SQL
 
 ---
 
-## 9. References
+## 11. Airlock ops (A0-A8)
+
+Invite-source-aware member verification. Plan source:
+`~/Projects/SolStitch/internal/airlock_plan.md`. Smoke matrix:
+`SMOKE_TEST_AIRLOCK.md` (28+ scenarios).
+
+### Pre-flight (do once per server)
+
+1. Discord developer portal → Stitzy app → Bot → enable **Server Members Intent**
+2. Server settings → Roles → Stitzy → enable **Manage Roles + Ban Members + Kick Members**; drag Stitzy's role ABOVE `@Outsider` in the hierarchy
+3. Create roles `@Outsider`, `@Insider` (or use existing default-member role)
+4. Create channels `#outside` (visible to @Outsider + mods only, posting by @Outsider allowed), `#triage` (mod-only)
+5. Populate `.env`:
+   ```
+   SABLE_ROLES_AIRLOCK_ROLES_JSON={"<guild_id>":"<outsider_role_id>"}
+   SABLE_ROLES_AIRLOCK_DEFAULT_MEMBER_ROLES_JSON={"<guild_id>":"<insider_role_id>"}
+   SABLE_ROLES_AIRLOCK_MOD_CHANNELS_JSON={"<guild_id>":"<triage_channel_id>"}
+   SABLE_ROLES_AIRLOCK_TRIAGE_ROLES_JSON={"<guild_id>":["<team_role_id>","<mod_role_id>"]}
+   SABLE_ROLES_TEAM_INVITERS_JSON={"<guild_id>":["<user_id>","..."]}
+   SABLE_ROLES_AIRLOCK_ENABLED=true
+   ```
+6. Pin `PINNED_WAITING_ROOM_MESSAGE.md` content in `#outside`
+7. Walk `SMOKE_TEST_AIRLOCK.md` end-to-end with an alt account
+
+### Daily monitoring
+
+```bash
+# Pending holds RIGHT NOW
+sqlite3 ~/.sable/sable.db "
+SELECT user_id, joined_at, attributed_invite_code
+FROM discord_member_admit
+WHERE airlock_status='held'
+ORDER BY joined_at ASC;
+"
+
+# Last 24h activity histogram
+sqlite3 ~/.sable/sable.db "
+SELECT airlock_status, COUNT(*)
+FROM discord_member_admit
+WHERE joined_at > datetime('now','-1 day')
+GROUP BY airlock_status;
+"
+
+# Recent mod decisions
+sqlite3 ~/.sable/sable.db "
+SELECT timestamp, action, json_extract(detail_json,'\$.user_id'), json_extract(detail_json,'\$.reason')
+FROM audit_log
+WHERE source='sable-roles' AND action LIKE 'fitcheck_airlock_%'
+AND timestamp > datetime('now','-1 day')
+ORDER BY id DESC LIMIT 20;
+"
+```
+
+### Emergency kill switch
+
+```bash
+# Edit .env
+SABLE_ROLES_AIRLOCK_ENABLED=false
+# Then restart
+pkill -f sable_roles.main && cd ~/Projects/sable-roles && nohup .venv/bin/python -m sable_roles.main >> /tmp/sable_roles.log 2>&1 & disown
+```
+
+New joiners after the restart bypass airlock entirely. Existing
+airlocked members stay airlocked — mod must `/admit` or strip
+@Outsider manually via Discord UI. Re-flip `AIRLOCK_ENABLED=true` to
+resume normal operation.
+
+### Common ops
+
+- **Force re-snapshot of invites**: `pkill -f sable_roles.main` + restart. `on_ready → airlock.bootstrap()` re-fetches `guild.invites()`.
+- **Add a team-inviter at runtime**: mod (team-tier) runs `/add-team-inviter @user` in SolStitch. Persists to `discord_team_inviters`, no restart.
+- **List team-inviters**: mod runs `/list-team-inviters` — ephemeral.
+- **Inspect a user's airlock state**: mod runs `/airlock-status @user` — ephemeral with attribution + decision history.
+- **Triage queue**: mod runs `/airlock-status` (no arg) — ephemeral list of all pending holds.
+
+### Common failures
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| New joiners get default access (no airlock role) | Members intent not enabled in dev portal | Toggle ON, restart bot |
+| `discord.Forbidden` on role assignment | Stitzy role below @Outsider in hierarchy | Drag Stitzy above @Outsider |
+| All joiners airlocked (even team invites) | `TEAM_INVITERS_BOOTSTRAP` empty / wrong guild_id | Repopulate `.env`, restart |
+| `/admit` not visible to mods | `AIRLOCK_TRIAGE_ROLES` empty for guild | Populate `.env`, restart |
+| Mod ping never lands in #triage | `AIRLOCK_MOD_CHANNELS` wrong channel id, OR Stitzy can't view #triage | Fix env + grant View Channel + Send Messages to Stitzy on #triage |
+
+---
+
+## 12. References
 
 - **Build plan:** `~/Projects/SolStitch/internal/fitcheck_v1_build_plan.md` — read before any architectural change
 - **Build TODO + audit history:** `~/Projects/SolStitch/internal/fitcheck_build_TODO.md`

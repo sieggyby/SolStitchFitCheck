@@ -131,6 +131,7 @@ Bot deletes any text-only post, including from `@Atelier` (admins). Discord role
 - **Small patches over rewrites.** Don't refactor `fitcheck_streak.py` cosmetically — it was audited byte-for-byte against the build plan across 5 chunks.
 - **Tests use `pytest-asyncio` in `asyncio_mode=auto`.** Don't add explicit `@pytest.mark.asyncio` decorators — `pyproject.toml` sets the mode globally.
 - **`conftest.py` fixture `fitcheck_module` patches the three module-level dicts** (`FITCHECK_CHANNELS`, `_FITCHECK_CHANNEL_IDS`, `_CHANNEL_TO_GUILD`, `_pending_recomputes`) per test. Any new module-level state needs to be added there or tests will leak state across runs.
+- **Module-level dicts shared cross-feature MUST be reset via `.clear()`, NOT rebound.** `burn_me._burn_invoke_cooldown` is imported by reference into `roast.py`; rebinding it (`monkeypatch.setattr(bm, "_burn_invoke_cooldown", {})`) silently severs the identity that `roast.py` sees, so a cross-feature test would stop sharing the cooldown. Use the autouse `.clear()` pattern in `tests/test_roast_peer_path.py` as the template.
 - **Don't change `_format_streak` output without updating the SableWeb / future-API consumer expectations** — the angle-bracket embed suppression on the best-fit URL is load-bearing.
 - **DB writes go through SablePlatform helpers, not raw SQL.** `discord_streaks.upsert_streak_event` / `update_reaction_score` / `get_event` / `compute_streak_state` are the only surface. Match the SableTracking pattern of strict layering.
 - **Audit-log every enforcement action.** `actor="discord:bot:<bot_user_id>"`, `source="sable-roles"`, `org_id=<resolved>`, `entity_id=None`, structured `detail` dict.
@@ -208,39 +209,95 @@ See `~/Projects/SolStitch/internal/fitcheck_build_TODO.md` for chunk-level minor
 ```
 sable_roles/
   __init__.py
-  main.py                    — SableRolesClient + entrypoint
-  config.py                  — env-driven config (token + 3 JSON env vars + DM_BANK + tunables)
+  main.py                    — SableRolesClient + entrypoint (registers fitcheck → roast → vibe_observer in order)
+  cli.py                     — operator CLI (backfill_blocklist, grandfather_restoration_tokens)
+  config.py                  — env-driven config: token, FITCHECK_CHANNELS, GUILD_TO_ORG, MOD_ROLES,
+                               INNER_CIRCLE_*, BURN_*, PEER_ROAST_ROLES (R2), PERSONALIZE_ADMINS (R2),
+                               OBSERVATION_CHANNELS (R2), VIBE_* (R2), DM_BANK + tunables
   features/
     __init__.py
-    fitcheck_streak.py       — on_message, on_raw_reaction_add/remove, /streak,
+    fitcheck_streak.py       — on_message, on_raw_reaction_add/remove, /streak, /relax-mode,
                                _format_streak, _schedule_recompute, _recompute_after_delay,
-                               _is_fitcheck_channel, _guild_for, close (debounce drain)
+                               close (debounce drain). Image-branch tail dispatches:
+                               burn_me.maybe_roast + roast.maybe_grant_restoration_token (R8)
+    burn_me.py               — /set-burn-mode, /burn-me, /stop-pls (sticky blocklist + vibe-purge R4);
+                               generate_roast → (text, audit_id) tuple (R7) w/ optional actor_user_id +
+                               vibe_block kwargs (R11); record_roast_reply helper (R7); maybe_roast
+    roast.py                 — /set-personalize-mode (R3); context-menu "Roast this fit" router
+                               (R5 mod + R7 peer dispatch); _handle_peer_roast w/ token economy + caps +
+                               refunds + DM + flag (R7); _maybe_grant_monthly_token seam (R6);
+                               /my-roasts (R6); /peer-roast-report (R9); _maybe_fetch_vibe_block (R11);
+                               maybe_grant_restoration_token (R8); _handle_flag_reaction (R7);
+                               _send_peer_roast_dm; register(client) composes with existing handlers
+    vibe_observer.py         — R10/R11: on_message + on_raw_reaction_add raw capture (composes with
+                               existing handlers); daily rollup cron; nightly GC; weekly inference cron
+                               (gated on personalize_mode_on + check_budget); _maybe_grant_*
+                               token + _send_peer_roast_dm. VIBE_OBSERVATION_ENABLED kill switch.
+                               start_tasks / stop_tasks for background loops
+    airlock.py               — A3-A6: invite-source-aware new-member verification.
+                               _fetch_live_invites + _persist_invite_snapshot (split-fetch pattern so
+                               diff baseline survives until after attribute_join), _on_invite_create,
+                               _on_invite_delete, _handle_member_join (team auto-admit OR
+                               non-team hold w/ DM + #triage ping), _handle_member_remove
+                               (left_during_airlock transition), /admit + /ban + /kick +
+                               /airlock-status (AIRLOCK_TRIAGE_ROLES tier), /add-team-inviter +
+                               /list-team-inviters (MOD_ROLES team-only tier), _can_triage_airlock
+                               + _format_mod_ping pure helpers. AIRLOCK_ENABLED kill switch.
+                               bootstrap(client) wires env-seed team-inviters + invite-snapshot
+                               first-fetch on on_ready (reconnect-safe).
+  prompts/
+    burn_me_system.py        — locked roast voice + safety rails (B5)
+    vibe_infer_system.py     — R11: strict-JSON vibe inference prompt (5 fields, imperative denylist)
 tests/
-  conftest.py                — fitcheck_module fixture: patches FITCHECK_CHANNELS +
-                               reverse-lookup tables + _pending_recomputes per test
-  test_image_detection.py
-  test_dm_bank.py
-  test_dm_cooldown.py
-  test_unconfigured_guild.py
-  test_handler_resilience.py
-  test_reaction_recompute.py
-  test_debounce_race.py
-  test_format_streak.py
-INVITE_SETUP.md              — C7: Discord developer portal walkthrough + invite URL
-SMOKE_TEST.md                — C8: 10-scenario manual smoke against a test guild
-OPERATIONS_RUNBOOK.md        — Live-ops runbook: boot, monitor, restart, deploy, rollback
+  conftest.py                — fitcheck_module fixture, fetch_audit_rows, fetch_streak_rows
+  test_image_detection.py / test_dm_bank.py / test_dm_cooldown.py / test_unconfigured_guild.py
+  test_handler_resilience.py / test_reaction_recompute.py / test_debounce_race.py
+  test_format_streak.py / test_is_mod.py
+  test_relax_mode_behavior.py / test_relax_mode_command.py
+  test_burn_me_commands.py / test_burn_me_integration.py / test_burn_me_pipeline.py / test_burn_me_state.py
+  test_stop_pls_blocklist.py / test_maybe_roast_blocklist.py / test_cli_backfill_blocklist.py
+  test_personalize_toggle.py             — R3 /set-personalize-mode
+  test_roast_mod_path.py                 — R5 mod context-menu
+  test_my_roasts.py                      — R6 /my-roasts + lazy-grant seam
+  test_roast_peer_path.py                — R7 peer path + DM + 🚩 flag + router dispatch
+  test_streak_restoration.py             — R8 maybe_grant_restoration_token + CLI grandfather
+  test_peer_roast_report.py              — R9 /peer-roast-report
+  test_vibe_observer.py                  — R10 listener + rollup + GC + kill switch
+  test_vibe_inference.py                 — R11 inference + vibe_block injection
+  test_airlock.py                        — A3-A6 invite snapshot + member join + mod commands
+INVITE_SETUP.md              — Discord developer portal walkthrough + invite URL
+SMOKE_TEST.md                — fitcheck V1 smoke (10 scenarios)
+SMOKE_TEST_ROAST.md          — R12: /roast V1+V2 + personalization smoke (28 scenarios)
+PINNED_FITCHECK_MESSAGE.md   — R12: canonical mechanic reference text for ops to pin in #fitcheck
+SMOKE_TEST_AIRLOCK.md        — A7: airlock smoke (15+ scenarios)
+PINNED_WAITING_ROOM_MESSAGE.md — A7: proof-of-aura text for ops to pin in #outside
+OPERATIONS_RUNBOOK.md        — Live-ops runbook: boot, monitor, vibe cron, pin sequence, rollback
 AGENTS.md / CLAUDE.md        — Mirror context files for AI assistants
 README.md                    — Setup + run + test
-pyproject.toml               — discord.py>=2.7, python-dotenv, pytest, pytest-asyncio (asyncio_mode=auto)
+pyproject.toml               — discord.py>=2.7, anthropic, python-dotenv, pytest, pytest-asyncio
 .env / .env.example          — live env / template (gitignored)
 .gitignore                   — excludes .env + .venv + caches
 ```
 
 **External dependencies (other Sable repos):**
-- `~/Projects/SablePlatform/sable_platform/db/discord_streaks.py` — DB helpers
-- `~/Projects/SablePlatform/sable_platform/db/migrations/043_discord_streak_events.sql` — Schema
-- `~/Projects/SablePlatform/sable_platform/alembic/versions/b2da0d6b1be1_*.py` — Postgres migration
-- `~/Projects/SablePlatform/tests/db/test_discord_streaks.py` — 19 DB-layer tests
-- `~/Projects/SolStitch/internal/fitcheck_v1_build_plan.md` — Source-of-truth plan
-- `~/Projects/SolStitch/internal/fitcheck_build_TODO.md` — Audit history + minor follow-ups
-- `~/Projects/SolStitch/internal/ship_dms.md` — Live-ship runbook (Brian + Cahit DMs, pre-flight, magic moment, rollback)
+- `~/Projects/SablePlatform/sable_platform/db/discord_streaks.py` — streak helpers + list_active_streak_users (R8)
+- `~/Projects/SablePlatform/sable_platform/db/discord_burn.py` — opt-in + daily-cap helpers (B5)
+- `~/Projects/SablePlatform/sable_platform/db/discord_guild_config.py` — relax/burn/personalize mode (R3)
+- `~/Projects/SablePlatform/sable_platform/db/discord_roast.py` — blocklist + token economy + flags +
+  aggregate_peer_roast_report + last_consumed_token (R6) + find_peer_roast_for_bot_reply (R7) (R1+R6+R7)
+- `~/Projects/SablePlatform/sable_platform/db/discord_user_vibes.py` — message-observations,
+  rollups, vibe upsert + validation, purge (R1) + list_recent_observation_users (R10)
+- `~/Projects/SablePlatform/sable_platform/db/discord_airlock.py` — A1: invite snapshot diff,
+  team-inviter allowlist, member admit ledger with airlock state machine
+- `~/Projects/SablePlatform/sable_platform/db/migrations/043_discord_streak_events.sql`
+- `~/Projects/SablePlatform/sable_platform/db/migrations/045_relax_mode_persist.sql` (B3)
+- `~/Projects/SablePlatform/sable_platform/db/migrations/046_burn_optins_random_log.sql` (B5/R0)
+- `~/Projects/SablePlatform/sable_platform/db/migrations/047_roast_personalization.sql` (R1) — 6 new tables + alter
+- `~/Projects/SablePlatform/sable_platform/db/migrations/048_airlock.sql` (A1) — 3 tables for airlock
+- `~/Projects/SolStitch/internal/fitcheck_v1_build_plan.md` — fitcheck V1 plan
+- `~/Projects/SolStitch/internal/fitcheck_build_TODO.md` — fitcheck V1 audit history
+- `~/Projects/SolStitch/internal/burn_me_v1_build_plan.md` — burn-me V1 plan
+- `~/Projects/SolStitch/internal/burn_me_build_TODO.md` — burn-me V1 audit history
+- `~/Projects/SolStitch/internal/roast_v1_v2_personalization_plan.md` — /roast plan (R0-R13)
+- `~/Projects/SolStitch/internal/roast_build_TODO.md` — /roast audit history
+- `~/Projects/SolStitch/internal/ship_dms.md` — Live-ship runbook (Brian + Cahit DMs)

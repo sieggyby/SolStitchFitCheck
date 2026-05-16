@@ -18,7 +18,7 @@ from sqlalchemy import text
 from sable_platform.db.connection import get_db
 
 from sable_roles.config import GUILD_TO_ORG, SABLE_ROLES_DISCORD_TOKEN
-from sable_roles.features import fitcheck_streak
+from sable_roles.features import airlock, burn_me, fitcheck_streak, roast, vibe_observer
 
 logger = logging.getLogger("sable_roles")
 
@@ -33,13 +33,27 @@ class SableRolesClient(discord.Client):
     def __init__(self) -> None:
         intents = discord.Intents.default()
         intents.message_content = True  # privileged — must be enabled in dev portal
+        # A0: airlock requires on_member_join + on_member_remove, which
+        # need the Members privileged intent. Must also be ON in the
+        # Discord developer portal under Bot → Privileged Gateway Intents.
+        intents.members = True
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self) -> None:
         # Register feature handlers and slash commands BEFORE syncing.
+        # Order matters: roast + vibe_observer + airlock COMPOSE with
+        # whatever event handlers are already bound (wrap-existing-handler
+        # pattern), so the @client.event-binding modules must register first.
         fitcheck_streak.register(self)
         fitcheck_streak.register_commands(self.tree)
+        burn_me.register_commands(self.tree)
+        roast.register(self)  # R7: 🚩 reaction handler (composes)
+        roast.register_commands(self.tree, client=self)
+        vibe_observer.register(self)  # R10: msg + reaction observation (composes)
+        vibe_observer.start_tasks()    # R10: rollup + GC background loops
+        airlock.register(self)  # A3+A4: on_member_join/remove/invite_* (composes)
+        airlock.register_commands(self.tree, client=self)  # A5+A6: mod commands
         # Per-guild instant sync via copy_global_to (SableTracking pattern).
         for guild_id_str in GUILD_TO_ORG:
             guild = discord.Object(id=int(guild_id_str))
@@ -62,9 +76,18 @@ class SableRolesClient(discord.Client):
             recent = row[0] if row else 0
             if recent == 0:
                 logger.warning("no events in last 24h — was the bot offline?")
+        # A3: airlock bootstrap (invite snapshot + team-inviter env seed).
+        # Runs on every on_ready (reconnect-safe) — guards against the
+        # restart-blackout case where the first joiner after boot would
+        # otherwise be unattributable.
+        try:
+            await airlock.bootstrap(self)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("airlock bootstrap failed: %s", exc)
 
     async def close(self) -> None:
         # Graceful drain. Client.close() is discord.py 2.x's documented shutdown hook.
+        vibe_observer.stop_tasks()
         await fitcheck_streak.close()
         await super().close()
 
