@@ -141,7 +141,10 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 "you're not a mod.", ephemeral=True
             )
             return
+        # Same-state no-op gate (state_pin plan P12): read prior mode
+        # BEFORE the upsert so the announce only fires on a real change.
         with get_db() as conn:
+            prior_cfg = discord_guild_config.get_config(conn, guild_id)
             discord_guild_config.set_burn_mode(
                 conn,
                 guild_id,
@@ -165,6 +168,22 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             f"burn-me default mode set to **{mode.value}**.",
             ephemeral=True,
         )
+
+        # State-pin announce — only on a real change. Inline import to
+        # keep state_pin out of burn_me's import graph at module-load.
+        if prior_cfg["current_burn_mode"] != mode.value:
+            import asyncio as _asyncio
+            from sable_roles.features import state_pin as _sp
+            _asyncio.create_task(
+                _sp.announce_state_change(
+                    interaction.client,
+                    guild_id=guild_id,
+                    org_id=org_id,
+                    characteristic="burn_mode",
+                    new_state_summary=_burn_summary(mode.value),
+                    changed_by_user_id=interaction.user.id,
+                )
+            )
 
     @tree.command(
         name="burn-me",
@@ -318,6 +337,26 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             else "you're already on the list — no roasts incoming."
         )
         await interaction.followup.send(body, ephemeral=True)
+
+
+def _burn_summary(mode: str) -> str:
+    """State-pin summary for the burn_mode dimension.
+
+    Caller contract per :func:`state_pin._format_body`: FIRST line MUST
+    be ``state: <value>``. Modes are once / persist / never per the
+    /set-burn-mode app_commands.Choice enum.
+    """
+    effect = {
+        "once": "auto-roast on next fit, then opt-in clears",
+        "persist": "auto-roast on every fit until /stop-pls",
+        "never": (
+            "/burn-me REDACTED; mods can still right-click 'Roast this fit'"
+        ),
+    }.get(mode, "")
+    body = f"state: {mode}"
+    if effect:
+        body += f"\neffect: {effect}"
+    return body
 
 
 # --- B5: roast pipeline ---

@@ -67,6 +67,7 @@ from sable_roles.config import (
     SCORING_PROMPT_VERSION,
     SCORING_RETRY_DELAY_SECONDS,
 )
+from sable_roles.features import state_pin
 from sable_roles.features.fitcheck_streak import is_image
 from sable_roles.features.image_hashing import compute_phash_from_bytes
 from sable_roles.prompts.scoring_system import SYSTEM_PROMPT
@@ -657,6 +658,23 @@ def _log_cost_safe(
         logger.info("scoring cost log failed: %s", exc)
 
 
+def _scoring_summary(cfg: dict) -> str:
+    """State-pin summary for the scoring dimension.
+
+    Caller contract per :func:`state_pin._format_body`: FIRST line MUST
+    be ``state: <value>``; subsequent lines are characteristic-specific
+    config (thresholds, window). Excludes ``prompt_version`` + ``model_id``
+    per plan P10 (operational tells stay in audit-log detail; pinned
+    body stays minimum-leakage).
+    """
+    return (
+        f"state: {cfg['state']}\n"
+        f"threshold: {cfg['reaction_threshold']} reactions on one emoji\n"
+        f"window: {cfg['reveal_window_days']}d,"
+        f" min age {cfg['reveal_min_age_minutes']} min"
+    )
+
+
 def _is_manage_guild(interaction: discord.Interaction) -> bool:
     """True iff the invoking user has Manage Guild permission.
 
@@ -767,6 +785,20 @@ class _ScoringSetConfirmView(discord.ui.View):
                 f"audit row written. no public announcement was made."
             ),
             view=self,
+        )
+        # State-pin announce — the Confirm view only fires on a real
+        # state change (same-state short-circuit lives in the caller
+        # before view construction). Fire-and-forget; state_pin handles
+        # all errors internally + audits.
+        asyncio.create_task(
+            state_pin.announce_state_change(
+                interaction.client,
+                guild_id=self._guild_id,
+                org_id=self._org_id,
+                characteristic="scoring",
+                new_state_summary=_scoring_summary(cfg),
+                changed_by_user_id=interaction.user.id,
+            )
         )
         self.stop()
 

@@ -126,6 +126,24 @@ def _maybe_grant_monthly_token(
     return granted
 
 
+def _personalize_summary(on: bool) -> str:
+    """State-pin summary for the personalize_mode dimension.
+
+    Caller contract per :func:`state_pin._format_body`: FIRST line MUST
+    be ``state: <value>``. Personalize is a binary so the body is a
+    single canonical state line + a one-line operator-readable effect.
+    """
+    if on:
+        return (
+            "state: on\n"
+            "effect: /roast injects per-target vibe blocks; weekly inference cron active"
+        )
+    return (
+        "state: off\n"
+        "effect: /roast uses base prompt; vibe inference cron skipped"
+    )
+
+
 async def _handle_set_personalize_mode(
     interaction: discord.Interaction,
     mode_value: str,
@@ -154,7 +172,11 @@ async def _handle_set_personalize_mode(
         )
         return
     on = mode_value == "on"
+    # Same-state no-op gate (state_pin plan P12): read prior BEFORE
+    # set_personalize_mode (which audits inside the same txn) so the
+    # state-pin announce only fires on a real change.
     with get_db() as conn:
+        prior_cfg = discord_guild_config.get_config(conn, guild_id)
         discord_guild_config.set_personalize_mode(
             conn,
             guild_id=guild_id,
@@ -164,6 +186,25 @@ async def _handle_set_personalize_mode(
     await interaction.followup.send(
         f"personalize-mode is now **{mode_value}**.", ephemeral=True
     )
+
+    # State-pin announce — only on a real change. PERSONALIZE_ADMINS is
+    # per-guild user-allowlist, but state-pin uses the per-guild org_id
+    # from GUILD_TO_ORG for audit attribution. GUILD_TO_ORG is the
+    # canonical mapping; PERSONALIZE_ADMINS just gates the toggle.
+    if bool(prior_cfg["personalize_mode_on"]) != on:
+        org_id = GUILD_TO_ORG.get(guild_id)
+        if org_id is not None:
+            from sable_roles.features import state_pin as _sp
+            asyncio.create_task(
+                _sp.announce_state_change(
+                    interaction.client,
+                    guild_id=guild_id,
+                    org_id=org_id,
+                    characteristic="personalize_mode",
+                    new_state_summary=_personalize_summary(on),
+                    changed_by_user_id=interaction.user.id,
+                )
+            )
 
 
 async def _handle_mod_roast(

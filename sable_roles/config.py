@@ -27,6 +27,15 @@ GUILD_TO_ORG: dict = json.loads(
 HEALTH_CHANNELS: dict = json.loads(
     os.environ.get("SABLE_ROLES_HEALTH_CHANNELS_JSON", "{}")
 )
+# State-pin surface — per-guild #sable-ops channel id. When unset for a
+# guild, announce_state_change is a no-op (audits `fitcheck_state_pin_no_ops_channel`
+# LOW and returns). Distinct from HEALTH_CHANNELS by design (state-pin
+# plan P14) so a future health feature can claim that var without
+# semantic collision.
+# Shape: {"<guild_id>": "<ops_channel_id>"}
+OPS_CHANNELS: dict = json.loads(
+    os.environ.get("SABLE_ROLES_OPS_CHANNELS_JSON", "{}")
+)
 # Per-guild list of role IDs whose holders count as "mods" for mod-only slash
 # commands like /relax-mode and (V2) /set-burn-mode + /burn-me @user. Shape:
 #   {"<guild_id>": ["<role_id>", ...]}

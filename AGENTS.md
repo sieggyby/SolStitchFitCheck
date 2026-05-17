@@ -172,6 +172,34 @@ Bot deletes any text-only post, including from `@Atelier` (admins). Discord role
 
 ---
 
+### State Pin (branch `state-pin`, default-invisible)
+
+**One-line:** when a mod changes any Stitzy-managed state dimension (scoring / burn_mode / relax_mode / personalize_mode) AND the new state differs from the old, the bot posts a system-voice state-summary message in the per-guild ops channel and pins it, unpinning any prior pin for the same dimension. #sable-ops's pinned-message list becomes a live dashboard of current bot state.
+
+**Default-invisible deploy.** Until `SABLE_ROLES_OPS_CHANNELS_JSON` has an entry for a guild, `state_pin.announce_state_change` audits `fitcheck_state_pin_no_ops_channel` LOW and returns without sending or pinning. No new prod behavior on deploy; operator opts in per-guild by setting the env var + granting the bot Manage Messages on #sable-ops.
+
+**Four characteristics tracked.** `scoring` (set via `/scoring action:set state:<off|silent|revealed>`), `burn_mode` (`/set-burn-mode`), `relax_mode` (`/relax-mode`), `personalize_mode` (`/set-personalize-mode`). Each gets a dedicated pinned message in the ops channel via `discord_state_pins` (mig 054) one-row-per-(guild_id, characteristic) with an optimistic-lock UPDATE for replace.
+
+**Same-state no-op gate.** Each of the four call sites reads prior config BEFORE the SP-side helper write and only fires `asyncio.create_task(state_pin.announce_state_change(...))` when the new state differs. Operator pressing `/relax-mode off` when already off does NOT rotate the pin (operator confusion: "did I actually change anything?").
+
+**Coalescing dict + per-channel async lock.** `_pending_announcements: dict[(guild_id, characteristic), Task]` cancels in-flight prior on a rapid toggle (last-write-wins). `_channel_locks: dict[channel_id, asyncio.Lock]` serializes cross-characteristic pin ops on the same channel — Discord rate-limits pin/unpin at ~5/4s per channel. Both reset via `.clear()` in the autouse `state_pin_module` test fixture.
+
+**CancelledError discipline preserved.** Outer try in `announce_state_change` RE-RAISES `asyncio.CancelledError` so the `close()` drain's `asyncio.gather` sees clean unwind. Inner excepts catch `SQLAlchemyError` + `discord.HTTPException` + a final `Exception` sink for defense-in-depth.
+
+**Optimistic-lock millisecond resolution.** `discord_state_pins.upsert_state_pin` uses `_now_iso_ms` (mirror of `discord_streaks._now_iso_ms`) so two writers in the same wall-clock second can't both succeed against the same expected token. Caller passes `expected_updated_at=prior["updated_at"]` from the immediately-prior `get_state_pin` call; lost race returns `False` and the caller self-deletes the just-posted pin + audits `fitcheck_state_pin_lost_race`.
+
+**Boot-time orphan sweep + opportunistic dup-pin check.** `sweep_orphan_pins` (one-shot per process via internal `_sweep_done` guard, composed onto on_ready by `register()`) lists each ops channel's pinned messages, parses the `**stitzy state · <char>**` headline, and unpins any pin whose DB pointer doesn't match. Step d.5 inside `_do_announce` runs the same parser-driven check inside the per-channel lock so a cancelled-prior orphan doesn't sit visible until next boot. Both audit `fitcheck_state_pin_orphan_swept` with `via: restart_sweep | opportunistic_pre_post`.
+
+**OPS_CHANNELS misconfig is non-fatal but loud.** `_filter_unique_ops_channels` rejects duplicate channel_id values across guilds (would cause cross-guild pin-stomp) and blank/whitespace/0 values, logging an error per case with the surviving guild named so the operator sees the misconfig in journalctl.
+
+**Message body voice = system, not Stitzy.** Headline `**stitzy state · <characteristic>**` (lowercase, matches Stitzy house style without sliding into roast voice) + `state: <value>` first line + characteristic-specific config lines + `last changed: <iso-minute> by @<plain-text-name> (id: <user_id>)`. NO clickable mention (P9), NO `prompt_version` or `model_id` leak (P10), `allowed_mentions=AllowedMentions.none()` (defense against display-name mention-injection).
+
+**Six-place migration contract for 054.** Per AGENTS.md: SQL + Alembic + connection.py + migrate_pg.py (`TABLE_LOAD_ORDER` + `SEQUENCE_TABLES`) + schema.py + version-literal bumps in `tests/db/test_migrations.py`, `tests/db/test_connection.py`, `tests/cli/test_init.py`, `docs/CLI_REFERENCE.md`. Mig 054 follows the existing Alembic-`BigInteger` / schema.py-`Integer` precedent (mirroring migs 050+052 line-for-line — pre-existing drift accepted scope-out per plan PR4-H2).
+
+**Plan + QA refs.** Design plan: `~/Projects/SolStitch/internal/state_pin_plan.md` (rev 7, APPROVED after 6 adversarial rounds). Implementation QA log: `~/Projects/SolStitch/internal/state_pin_qa_log.md` (3 adversarial rounds, APPROVED).
+
+---
+
 ## Working conventions
 
 - **Small patches over rewrites.** Don't refactor `fitcheck_streak.py` cosmetically — it was audited byte-for-byte against the build plan across 5 chunks.
@@ -249,6 +277,7 @@ See `~/Projects/SolStitch/internal/fitcheck_build_TODO.md` for chunk-level minor
 - `SABLE_ROLES_FITCHECK_CHANNELS_JSON` — JSON: `{"<guild_id>": {"org_id": "<sable_org>", "channel_id": "<fitcheck_channel>"}}`. Live SolStitch entry: `{"1501026101730869290":{"org_id":"solstitch","channel_id":"1501073373252292709"}}`.
 - `SABLE_ROLES_GUILD_TO_ORG_JSON` — JSON: `{"<guild_id>": "<org_id>"}`. Live SolStitch: `{"1501026101730869290":"solstitch"}`.
 - `SABLE_ROLES_HEALTH_CHANNELS_JSON` — JSON: `{"<guild_id>": "<health_channel_id>"}`. Currently `{}` — bot has no overwrite for SolStitch `#sable-ops`, V1 health goes to stdout only.
+- `SABLE_ROLES_OPS_CHANNELS_JSON` — JSON: `{"<guild_id>": "<ops_channel_id>"}` for the State Pin surface. Empty `{}` (the deploy default) makes `state_pin.announce_state_change` a no-op + LOW audit per guild. Operator sets per-guild entry + grants the bot **Manage Messages** on the named channel to enable the pinned-state-dashboard. Distinct from `HEALTH_CHANNELS_JSON` by design (state_pin plan P14 — semantic drift cheaper than reusing a "health"-named var for the operational-state-dashboard purpose).
 
 **Scored Mode V2 env vars (Pass A+B+C — all optional with sensible defaults):**
 
@@ -303,6 +332,17 @@ See `~/Projects/SolStitch/internal/fitcheck_build_TODO.md` for chunk-level minor
 - `reveal_pipeline.TRIGGER_REACTIONS` / `TRIGGER_THREAD_MESSAGES` / `TRIGGER_PENDING` / `SUCCESS_TRIGGERS` — reveal-trigger string constants (NIT-N3 fix)
 - `reveal_pipeline._build_reveal_text(score_row, display_name)` — pure formatter; tone band by percentile
 - `reveal_pipeline._PENDING_REVEALS_CAP` — module constant (1024) gating eviction in `_pending_reveals` dict
+
+**State Pin:**
+- `state_pin.announce_state_change(client, *, guild_id, org_id, characteristic, new_state_summary, changed_by_user_id)` — fire-and-forget entry called from the four slash-command handlers via `asyncio.create_task`. Coalesces in-flight prior, holds per-channel lock, posts + pins + upserts under optimistic lock + cleans up on lost race
+- `state_pin.sweep_orphan_pins(client)` — idempotent one-shot boot-time orphan-pin cleanup; internal `_sweep_done` guard makes any re-entrant call a no-op
+- `state_pin.register(client)` — wires the sweep onto on_ready; safe-binds `_client`; the only module-level discord.py event hook (sweep is slash-command-triggered, not gateway-event-triggered)
+- `state_pin.close()` — drains `_pending_announcements` tasks; called from `SableRolesClient.close()` BEFORE `super().close()` (mirrors `fitcheck_streak.close` + `reveal_pipeline.close` precedents)
+- `state_pin._format_body(client, characteristic, summary, user_id)` — async body formatter; awaits `leaderboard._resolve_display_name`. Single source of truth for the headline shape consumed by `_extract_characteristic_from_headline`
+- `state_pin._STATE_HEADLINE_PREFIX` / `_STATE_HEADLINE_SUFFIX` — module constants paired across formatter + sweep parser via `removesuffix(_STATE_HEADLINE_SUFFIX)`
+- `state_pin._KNOWN_CHARACTERISTICS` — frozenset whitelist; entry-side defense in `announce_state_change` raises `ValueError` synchronously on call-site typo (PR6-L2)
+- `state_pin._filter_unique_ops_channels()` — boot-time OPS_CHANNELS_JSON validator; rejects duplicate channel_ids across guilds + blank/whitespace/0 values with operator-readable error logs
+- `state_pin._PENDING_ANNOUNCEMENTS_CAP` — module constant (256) gating eviction in `_pending_announcements` dict (post-insert + `>` predicate, mirrors `leaderboard._evict_cooldown_if_full`)
 
 ---
 
@@ -360,6 +400,15 @@ sable_roles/
                                /scoring status | set <off|silent|revealed> slash command +
                                _ScoringSetConfirmView (danger Confirm, author-lock, on_timeout +
                                try/except around set_state per Pass C deferred polish).
+    state_pin.py             — State-pin surface: per-guild ops-channel pinned-state dashboard.
+                               announce_state_change (slash-command tail; fire-and-forget),
+                               sweep_orphan_pins (one-shot boot cleanup via _sweep_done guard,
+                               composed onto on_ready), per-channel lock + coalescing dict +
+                               optimistic-lock upsert + opportunistic dup-pin sweep at step d.5.
+                               Default-invisible: SABLE_ROLES_OPS_CHANNELS_JSON empty → no-op +
+                               LOW audit. Four characteristics (scoring / burn_mode / relax_mode
+                               / personalize_mode) each get one pin via discord_state_pins (mig
+                               054). close() drain wired into SableRolesClient.close().
     reveal_pipeline.py       — Scored Mode Pass C: debounced per-post recompute (5s, mirrors V1
                                fitcheck_streak debounce). on_raw_reaction_add/remove + on_message
                                (thread filter) + on_raw_message_delete COMPOSE wrappers. Per-emoji
@@ -447,6 +496,8 @@ pyproject.toml               — discord.py>=2.7, anthropic, python-dotenv, pyte
 - `~/Projects/SablePlatform/sable_platform/db/migrations/050_discord_fitcheck_scores.sql` — Scored Mode Pass B: per-fit scoring row (success/failed)
 - `~/Projects/SablePlatform/sable_platform/db/migrations/051_discord_scoring_config.sql` — Scored Mode Pass B: per-guild state machine; default state='off'
 - `~/Projects/SablePlatform/sable_platform/db/migrations/052_discord_fitcheck_emoji_milestones.sql` — Scored Mode Pass C: per-(post, emoji, milestone) crossing state for durable dedup
+- `~/Projects/SablePlatform/sable_platform/db/migrations/054_discord_state_pins.sql` — State Pin: one row per (guild_id, characteristic) tracking the currently-pinned "stitzy state" message id in #sable-ops. Optimistic-lock UPDATE via discord_state_pins.upsert_state_pin
+- `~/Projects/SablePlatform/sable_platform/db/discord_state_pins.py` — State Pin helper: get_state_pin + upsert_state_pin (millisecond-resolution optimistic-lock token mirroring discord_streaks._now_iso_ms)
 - `~/Projects/SolStitch/internal/fitcheck_v1_build_plan.md` — fitcheck V1 plan
 - `~/Projects/SolStitch/internal/burn_me_v1_build_plan.md` — burn-me V1 plan
 - `~/Projects/SolStitch/internal/roast_v1_v2_personalization_plan.md` — /roast plan (R0-R13)

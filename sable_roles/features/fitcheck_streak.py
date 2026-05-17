@@ -468,7 +468,11 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             )
             return
         on = mode.value == "on"
+        # Same-state no-op gate (state_pin plan P12): only fire the
+        # state-pin announce when the new state differs from the prior.
+        # Read prior BEFORE the upsert so we can compare cleanly.
         with get_db() as conn:
+            prior_cfg = discord_guild_config.get_config(conn, guild_id)
             discord_guild_config.set_relax_mode(
                 conn, guild_id, on=on, updated_by=str(interaction.user.id)
             )
@@ -491,6 +495,36 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             else "relax-mode **off** — normal enforcement restored."
         )
         await interaction.followup.send(body, ephemeral=True)
+
+        # State-pin announce — only on a real change. Inline import to
+        # match the burn_me / image_hashing / scoring_pipeline dispatch
+        # pattern below + avoid making state_pin's import graph a
+        # required dep of fitcheck_streak module-load.
+        if bool(prior_cfg["relax_mode_on"]) != on:
+            from sable_roles.features import state_pin as _sp
+            asyncio.create_task(
+                _sp.announce_state_change(
+                    interaction.client,
+                    guild_id=guild_id,
+                    org_id=org_id,
+                    characteristic="relax_mode",
+                    new_state_summary=_relax_summary(on),
+                    changed_by_user_id=interaction.user.id,
+                )
+            )
+
+
+def _relax_summary(on: bool) -> str:
+    """State-pin summary for the relax_mode dimension.
+
+    Caller contract per :func:`state_pin._format_body`: FIRST line MUST
+    be ``state: <value>``. Relax mode is a binary so the body is a
+    single canonical state line + a one-line operator-readable effect
+    description.
+    """
+    if on:
+        return "state: on\neffect: text allowed in #fitcheck, no auto-threading"
+    return "state: off\neffect: text deleted in #fitcheck, fits get auto-threads"
 
 
 async def close() -> None:
