@@ -4,7 +4,15 @@
 
 **SablePlatform is a separate, currently-private Sable repository.** It is *not* included in this GitHub repo. Without it installed (`pip install -e <path-to-SablePlatform>`), this repo is **review-only**: the code reads and reasons fine, but `import sable_roles.main` raises `ModuleNotFoundError: sable_platform` and `pytest` fails at collection.
 
-This document specifies the **entire** `sable_platform` surface `sable-roles` touches — six symbols plus one table. If you are reviewing this repo or building a stub, this is the complete contract. Anything not listed here, `sable-roles` does not use.
+This document specifies the **entire** `sable_platform` surface `sable-roles` touches. If you are reviewing this repo or building a stub, this is the complete contract. Anything not listed here, `sable-roles` does not use.
+
+The surface grew across V1 → V2 → Scored Mode V2. Today it spans:
+- 4 helper modules for the core fitcheck stack (§3–§3b): `discord_streaks`, `discord_guild_config`, `discord_burn`, `discord_roast`, `discord_user_vibes`, `discord_airlock`
+- 2 helper modules for Scored Mode V2 (§3c–§3d): `discord_fitcheck_scores`, `discord_scoring_config`
+- 1 audit-log helper (§4)
+- Tables across migrations 043 + 045–048 + 049–052
+
+The shape of every helper is the same: positional args after `conn`, `:named` SQL bind params (NOT `?`-positional), explicit `conn.commit()` after writes, bare-import style in `schema.py`.
 
 ---
 
@@ -20,9 +28,16 @@ from sable_platform.db.connection import get_db
 from sable_platform.db import discord_guild_config, discord_streaks
 from sable_platform.db.audit import log_audit
 from sable_platform.db.connection import get_db
+
+# sable_roles/features/burn_me.py / roast.py / vibe_observer.py / airlock.py
+from sable_platform.db import discord_burn, discord_roast, discord_user_vibes, discord_airlock
+
+# sable_roles/features/image_hashing.py / scoring_pipeline.py / reveal_pipeline.py (Scored Mode V2)
+from sable_platform.db import discord_fitcheck_scores, discord_scoring_config, discord_streaks
+from sable_platform.db.audit import log_audit
 ```
 
-That's it. Four modules: `sable_platform.db.connection`, `sable_platform.db.discord_streaks`, `sable_platform.db.discord_guild_config`, `sable_platform.db.audit`.
+Modules: `connection` + `audit` + `discord_streaks` + `discord_guild_config` + `discord_burn` + `discord_roast` + `discord_user_vibes` + `discord_airlock` + `discord_fitcheck_scores` + `discord_scoring_config`.
 
 ---
 
@@ -157,6 +172,71 @@ Upserts `current_burn_mode` for a guild. `mode` must be `"once"` or `"persist"` 
 
 ---
 
+## 3c. `sable_platform.db.discord_fitcheck_scores` (Scored Mode V2 — Pass B + Pass C)
+
+Per-fit scoring row + the reveal-fire CAS surface. All helpers are positional args after `conn`, `:named` SQL bind params, explicit `conn.commit()` after writes (same conventions as §3).
+
+Also includes the **leaderboard query contract** documented at module-doctring level: Pass D `/leaderboard` queries MUST filter `reveal_trigger IN ('reactions','thread_messages')` — `reveal_fired_at IS NOT NULL` is a one-and-done lock that ALSO covers the terminal failure states `'cancelled_deleted'` and `'publish_failed'`, which must not surface as ranked entries.
+
+**Pass B helpers (scoring path — called from `scoring_pipeline.py`):**
+
+- `upsert_score_success(conn, org_id, guild_id, post_id, user_id, posted_at, scored_at, model_id, prompt_version, axis_cohesion, axis_execution, axis_concept, axis_catch, raw_total, catch_detected, catch_naming_class, description, confidence, axis_rationales_json, curve_basis, pool_size_at_score_time, percentile) -> None` — INSERT ... ON CONFLICT (guild_id, post_id) DO UPDATE. Preserves `reveal_fired_at` / `reveal_post_id` / `reveal_trigger` / `invalidated_at` / `invalidated_reason` on conflict (re-scoring never clobbers terminal reveal state).
+- `record_score_failure(conn, org_id, guild_id, post_id, user_id, posted_at, scored_at, model_id, prompt_version, score_error) -> None` — inserts a `score_status='failed'` row. No reveal can ever fire for a failed score.
+- `get_score(conn, guild_id, post_id) -> dict | None` — full row by primary lookup. Returns the column dict or None.
+- `count_pool_size(conn, org_id, since_iso) -> int` — count of `score_status='success' AND invalidated_at IS NULL AND scored_at >= :since` rows. Drives the cold-start curve-basis gate.
+- `fetch_curve_pool_raw_totals(conn, org_id, since_iso) -> list[int]` — list of `raw_total` ints for percentile curving.
+- `invalidate_score(conn, guild_id, post_id, reason) -> None` — sets `invalidated_at = now()` + `invalidated_reason = :reason`. Mod-only; no slash-command surface in V1.
+
+**Pass C helpers (reveal-fire path — called from `reveal_pipeline.py`):**
+
+- `mark_reveal_fired(conn, guild_id, post_id, fired_at, reveal_trigger, placeholder_post_id='pending') -> bool` — CAS lock: `UPDATE ... SET reveal_fired_at = :fired_at, reveal_post_id = :placeholder, reveal_trigger = :trigger WHERE guild_id = :g AND post_id = :p AND reveal_fired_at IS NULL`. Returns `True` if the lock took (rowcount==1), `False` if already locked. Used with `placeholder_post_id='pending'` so a downstream `update_reveal_post_id` can swap in the real reply id after `message.reply()` succeeds.
+- `update_reveal_post_id(conn, guild_id, post_id, real_post_id) -> bool` — guarded swap: `UPDATE ... SET reveal_post_id = :real WHERE ... AND reveal_post_id = 'pending'`. Raises `ValueError` if `real_post_id == 'pending'` (defends against accidental no-op). Returns `True` on swap success.
+- `mark_reveal_publish_failed(conn, guild_id, post_id, failed_at) -> bool` — guarded `'pending'` → `'publish_failed'` for non-404 HTTP errors during reply publish. Companion to a HIGH `fitcheck_reveal_publish_failed` audit.
+- `convert_pending_to_cancelled_deleted(conn, guild_id, post_id, cancelled_at) -> bool` — guarded `'pending'` → `'cancelled_deleted'` for the 404-during-publish race (post deleted mid-reveal-publish). Companion to a HIGH `fitcheck_reveal_cancelled_deleted` audit with `via:publish_404`. Preserves the gaming-vector signal that a CAS-first design would silently drop.
+- `mark_reveal_cancelled_deleted(conn, guild_id, post_id, cancelled_at) -> bool` — delete-handler CAS path: `UPDATE ... SET reveal_fired_at = :cancelled_at, reveal_post_id = NULL, reveal_trigger = 'cancelled_deleted' WHERE ... AND reveal_fired_at IS NULL`. Used when `on_raw_message_delete` fires for a fit before its reveal-fire CAS landed. HIGH-severity audit emitted.
+- `record_emoji_milestone_crossing(conn, guild_id, post_id, emoji, milestone, crossed_at) -> bool` — INSERT ... ON CONFLICT DO NOTHING into `discord_fitcheck_emoji_milestones`. Returns `True` on first-crossing (audit should fire), `False` on duplicate (already-crossed, silent). Per-(post_id, emoji, milestone) durable state — restarts don't re-fire milestone audits.
+- `list_emoji_milestone_crossings_for_post(conn, guild_id, post_id) -> list[dict]` — diagnostic read for ops; returns all crossings rows for a fit.
+
+---
+
+## 3d. `sable_platform.db.discord_scoring_config` (Scored Mode V2 — Pass B)
+
+Per-guild scoring state machine + thresholds. One row per configured guild, created lazily by the first mod toggle (same pattern as §3b). All helpers are positional args after `conn`, `:named` SQL bind params, explicit `conn.commit()`.
+
+### `get_config`
+
+```python
+def get_config(conn: Connection, guild_id: str) -> dict
+```
+
+Returns a dict with keys: `guild_id`, `state` (`'off'` | `'silent'` | `'revealed'`), `state_changed_by`, `state_changed_at`, `reaction_threshold` (default `10`), `thread_message_threshold` (default `100`), `reveal_window_days` (default `7`), `reveal_min_age_minutes` (default `10`), `curve_window_days` (default `30`), `cold_start_min_pool` (default `20`), `model_id` (default `'claude-sonnet-4-6'`), `prompt_version` (default `'rubric_v1'`), `created_at`, `updated_at`.
+
+**For unconfigured guilds:** returns the default-shape dict with `state='off'` — does NOT insert a row. This is the load-bearing default-off invariant — no DB write happens until a mod explicitly calls `set_state`.
+
+### `set_state`
+
+```python
+def set_state(
+    conn: Connection,
+    guild_id: str,
+    state: str,                 # validated: 'off' | 'silent' | 'revealed'
+    changed_by: str,            # Discord user id of the invoking mod
+    org_id: str | None = None,  # for the inside-audit row
+) -> dict                       # returns the new config row
+```
+
+Upserts the row; on conflict updates `state`, `state_changed_by`, `state_changed_at`, `updated_at`. Validates `state` against the 3-state set (raises `ValueError` otherwise). Writes a `fitcheck_scoring_state_changed` audit row INSIDE the helper (single source of truth — `scoring_pipeline.py` does not write the audit separately).
+
+### `count_status_breakdown`
+
+```python
+def count_status_breakdown(conn: Connection, org_id: str, since_iso: str | None = None) -> dict
+```
+
+Returns `{"success": int, "failed": int}` — count of `discord_fitcheck_scores` rows by `score_status`, optionally filtered by `scored_at >= :since`. Drives the `/scoring status` ephemeral display.
+
+---
+
 ## 4. `sable_platform.db.audit.log_audit`
 
 ```python
@@ -191,6 +271,26 @@ log_audit(
 Actions this bot writes (V1): `fitcheck_text_message_deleted`, `fitcheck_thread_create_failed` — both with `source="sable-roles"` and `actor="discord:bot:<bot_user_id>"`.
 
 V2 adds: `fitcheck_relax_mode_toggled` — written by `/relax-mode`, with `source="sable-roles"` and `actor="discord:user:<invoking_user_id>"` (a real Discord user toggled it, not the bot).
+
+**Scored Mode V2 actions** (all `source="sable-roles"`, all bot-actor unless noted):
+
+| Action | Severity hint | Source feature module |
+|---|---|---|
+| `fitcheck_image_phash_recorded` | INFO | image_hashing (Pass A) |
+| `fitcheck_image_phash_failed` | INFO | image_hashing (Pass A) |
+| `fitcheck_repost_detected` | LOW | image_hashing (Pass A, same user) |
+| `fitcheck_image_theft_detected` | HIGH | image_hashing (Pass A, different user) |
+| `fitcheck_post_deleted` | LOW → CRITICAL | delete_monitor (Pass A; severity per `discord_fitcheck_scores` reaction/thread count + reveal-distance) |
+| `fitcheck_text_edit` | LOW | delete_monitor (Pass A; lengths only, never content) |
+| `fitcheck_scoring_state_changed` | INFO | discord_scoring_config.set_state (Pass B; actor = `discord:user:<mod_id>`) |
+| `fitcheck_score_recorded` | INFO | scoring_pipeline (Pass B) |
+| `fitcheck_score_failed` | WARN | scoring_pipeline (Pass B; after retry-once) |
+| `fitcheck_reaction_milestone` | INFO | reveal_pipeline (Pass C; per (post, emoji) at 5/8/10) |
+| `fitcheck_low_age_reactor` | LOW | reveal_pipeline (Pass C; <30d Discord account) |
+| `fitcheck_reveal_eligible` | INFO | reveal_pipeline (Pass C; threshold met, reveal scheduled) |
+| `fitcheck_reveal_fired` | INFO | reveal_pipeline (Pass C; reply posted) |
+| `fitcheck_reveal_cancelled_deleted` | HIGH | reveal_pipeline (Pass C; delete races publish OR delete fires post-eligible. `via:publish_404` when delete races publish) |
+| `fitcheck_reveal_publish_failed` | HIGH | reveal_pipeline (Pass C; non-404 HTTPException — gaming-vector preserved) |
 
 `audit_log` table columns the insert targets: `actor`, `action`, `org_id`, `entity_id`, `detail_json`, `source` (plus an autoincrement `id` and a timestamp default — both owned by SablePlatform's schema).
 
@@ -259,6 +359,107 @@ One row per configured guild, created lazily by the first mod toggle. Rows never
 - `current_burn_mode` — owned exclusively by `set_burn_mode`. Preserved on `set_relax_mode` conflict. Values constrained to `{"once", "persist"}` by the helper (no DB-level CHECK).
 - `updated_at`, `updated_by` — bumped on every helper call. `updated_by` is the Discord user ID of the invoking mod.
 
+### `discord_streak_events` Scored Mode V2 extension (migration 049 — Pass A)
+
+```sql
+ALTER TABLE discord_streak_events ADD COLUMN image_phash TEXT;
+CREATE INDEX idx_discord_streak_events_org_phash
+    ON discord_streak_events (org_id, image_phash);
+```
+
+Once-set immutable column populated by `set_phash_on_streak_event(conn, guild_id, post_id, phash)`. Lives on `discord_streak_events` (not `discord_fitcheck_scores`) because pHash + collision detection are valuable **regardless of scoring state** — Pass A defensive infra runs even when `state='off'`.
+
+### `discord_fitcheck_scores` (migration 050 — Pass B + Pass C)
+
+```sql
+CREATE TABLE IF NOT EXISTS discord_fitcheck_scores (
+    id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id                   TEXT NOT NULL,
+    guild_id                 TEXT NOT NULL,
+    post_id                  TEXT NOT NULL,
+    user_id                  TEXT NOT NULL,
+    posted_at                TEXT NOT NULL,
+    scored_at                TEXT NOT NULL,
+    model_id                 TEXT NOT NULL,
+    prompt_version           TEXT NOT NULL,
+    score_status             TEXT NOT NULL,           -- 'success' | 'failed'
+    score_error              TEXT,
+    axis_cohesion            INTEGER,
+    axis_execution           INTEGER,
+    axis_concept             INTEGER,
+    axis_catch               INTEGER,
+    raw_total                INTEGER,                 -- 0-40
+    catch_detected           TEXT,
+    catch_naming_class       TEXT,
+    description              TEXT,
+    confidence               REAL,
+    axis_rationales_json     TEXT,
+    curve_basis              TEXT,                    -- 'absolute' | 'rolling_30d'
+    pool_size_at_score_time  INTEGER,
+    percentile               REAL,                    -- 1-100
+    reveal_eligible          INTEGER NOT NULL DEFAULT 0,
+    reveal_fired_at          TEXT,
+    reveal_post_id           TEXT,                    -- 'pending' during in-flight publish, real id on success
+    reveal_trigger           TEXT,                    -- 'reactions' | 'thread_messages' | 'cancelled_deleted' | 'publish_failed'
+    invalidated_at           TEXT,
+    invalidated_reason       TEXT,
+    created_at               TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at               TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    UNIQUE (guild_id, post_id)
+);
+-- (plus indexes on user_pct, org_posted, status, reveal_fired)
+```
+
+**Column ownership / mutation rules:**
+- Scoring path (`upsert_score_success` / `record_score_failure`) owns: all axis + catch + description + confidence + rationales + curve + percentile columns + `score_status` + `score_error`.
+- Reveal path (`mark_reveal_fired` / `update_reveal_post_id` / `mark_reveal_publish_failed` / `convert_pending_to_cancelled_deleted` / `mark_reveal_cancelled_deleted`) owns: `reveal_fired_at` + `reveal_post_id` + `reveal_trigger`. Each transition is CAS-guarded.
+- `upsert_score_success`'s ON CONFLICT preserves the reveal columns — re-scoring (e.g. on a re-score job, future feature) never clobbers terminal reveal state.
+- `invalidated_at` / `invalidated_reason` are moderation-only (raw SQL or `invalidate_score`); excluded from leaderboard + curve corpus.
+- **`reveal_post_id='pending'` is a transient in-process state**, set by `mark_reveal_fired` and resolved seconds later by one of the three terminal helpers. A `'pending'` value persisting beyond ~30s indicates a crashed reveal — operator investigation required.
+
+### `discord_scoring_config` (migration 051 — Pass B)
+
+```sql
+CREATE TABLE IF NOT EXISTS discord_scoring_config (
+    id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id                   TEXT NOT NULL,
+    guild_id                 TEXT NOT NULL UNIQUE,
+    state                    TEXT NOT NULL DEFAULT 'off',  -- 'off' | 'silent' | 'revealed'
+    state_changed_by         TEXT,
+    state_changed_at         TEXT,
+    reaction_threshold       INTEGER NOT NULL DEFAULT 10,
+    thread_message_threshold INTEGER NOT NULL DEFAULT 100,
+    reveal_window_days       INTEGER NOT NULL DEFAULT 7,
+    reveal_min_age_minutes   INTEGER NOT NULL DEFAULT 10,
+    curve_window_days        INTEGER NOT NULL DEFAULT 30,
+    cold_start_min_pool      INTEGER NOT NULL DEFAULT 20,
+    model_id                 TEXT NOT NULL DEFAULT 'claude-sonnet-4-6',
+    prompt_version           TEXT NOT NULL DEFAULT 'rubric_v1',
+    created_at               TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at               TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+```
+
+**Default `state='off'` is load-bearing.** No row is inserted at deploy time — `get_config` returns the default-shape dict (with `state='off'`) for unconfigured guilds. The first `set_state` call by a mod is what creates the row. Guarantees a fresh deploy ships INVISIBLE.
+
+**One row per guild.** UNIQUE constraint on `guild_id` enforces. Mod-only `/scoring set` is the only path that mutates.
+
+### `discord_fitcheck_emoji_milestones` (migration 052 — Pass C)
+
+```sql
+CREATE TABLE IF NOT EXISTS discord_fitcheck_emoji_milestones (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id    TEXT NOT NULL,
+    post_id     TEXT NOT NULL,
+    emoji       TEXT NOT NULL,
+    milestone   INTEGER NOT NULL,     -- 5 | 8 | 10
+    crossed_at  TEXT NOT NULL,
+    UNIQUE (guild_id, post_id, emoji, milestone)
+);
+```
+
+Durable per-(post, emoji, milestone) crossing state. INSERT ... ON CONFLICT DO NOTHING means restarts never re-fire milestone audits. The reveal pipeline's `record_emoji_milestone_crossing` returns `True` on first-crossing (audit fires) and `False` on duplicate (silent skip).
+
 ---
 
 ## 6. If you want to actually run this repo
@@ -266,6 +467,6 @@ One row per configured guild, created lazily by the first mod toggle. Rows never
 The maintainer's choice (2026-05) is to keep this repo **review-only** on GitHub — the contract above is the substitute for shipping SablePlatform. To run tests or the bot yourself, you would need one of:
 
 1. **The real SablePlatform repo** — `pip install -e <path-to-SablePlatform>`, then `pip install -e .` here. This is how the maintainer runs it.
-2. **A stub `sable_platform` package** implementing exactly §2–§5 against in-memory SQLite. Not shipped here; this document is the spec you'd build it from. The four `discord_streaks` functions are pure SQL over one table, `log_audit` is one INSERT, and `get_db()` is a SQLAlchemy connection factory — a faithful stub is on the order of ~150 lines.
+2. **A stub `sable_platform` package** implementing exactly §2–§5 against in-memory SQLite. Not shipped here; this document is the spec you'd build it from. A faithful V1-only stub is on the order of ~150 lines; the full V2 + Scored Mode V2 surface is larger but each helper is still pure SQL over one table (~600-800 lines total).
 
 For pure code review and "point your Claude at it" understanding, you don't need either — the source plus this contract plus `CLAUDE.md`/`AGENTS.md` is the full picture.
