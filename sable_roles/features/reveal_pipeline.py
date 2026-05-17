@@ -44,13 +44,13 @@ close() drain). 5-second debounce window — slightly longer than V1's 2s
 to give the 10th reactor's neighbours a chance to land before recompute
 publishes, but the CAS lock makes the window cosmetic, not correctness.
 
-Silent → Revealed transition reading: implemented per the design §3
-literal ("state='revealed' at the moment threshold trips") — a fit scored
-in silent that gains its 10th reactor post-flip CAN reveal. The Pass C
-brief explicitly endorsed this reading; design §8.3 carries a stricter
-read ("posted after the transition") that the canonical plan doc should
-either tighten §3 to match or loosen §8.3 to match. Until the plan-doc
-clarification lands this module follows the brief.
+Silent → Revealed transition reading: implements design §8.3 strict
+("Reveals only on fits posted *after* the transition"). A silent-period
+fit's threshold trip post-flip earns milestone + low-age audits but
+NEVER fires a public reveal — the calibration period stays private
+forever. Implemented via a `posted_at >= state_changed_at` gate in
+step 9 of the recompute body. Plan §3 line 94 has been tightened in
+the canonical plan doc to match this reading.
 
 Pass C also lands the two Pass A+B deferred items
 (fitcheck_reaction_milestone + fitcheck_low_age_reactor — both surfaced
@@ -529,8 +529,41 @@ async def _recompute_after_delay(
         if trigger is None:
             return
 
-        # 9) Reveal-fire gate. Re-uses live_state from step 6.
+        # 9) Reveal-fire gates.
+        #   (a) live state must be revealed (re-uses live_state from step 6)
+        #   (b) post must have been posted AT OR AFTER the current revealed-
+        #       state transition timestamp. Implements design §8.3 strict
+        #       reading: "Silent → Revealed: NO historical reveals. Reveals
+        #       only on fits posted *after* the transition." Pre-flip
+        #       silent-period posts gain milestone audits (above) but never
+        #       a public reveal — calibration data stays private forever.
+        #       Design §3 has been tightened to match (plan-doc update
+        #       landed alongside this code).
+        #
+        #   state_changed_at SHOULD be non-NULL whenever live_state is
+        #   'revealed' (a transition must have happened to reach revealed).
+        #   Defensive: if it's somehow NULL or unparseable, fail closed
+        #   (skip the reveal) — better than firing on data we can't reason
+        #   about.
         if live_state != "revealed":
+            return
+        state_changed_at_raw = live_cfg.get("state_changed_at")
+        if not state_changed_at_raw:
+            logger.warning(
+                "reveal recompute: live state is 'revealed' but"
+                " state_changed_at is NULL for guild %s — fail-closed",
+                guild_id,
+            )
+            return
+        state_changed_at = _parse_iso(str(state_changed_at_raw))
+        if state_changed_at is None:
+            logger.warning(
+                "reveal recompute: state_changed_at %r failed parse for"
+                " guild %s — fail-closed",
+                state_changed_at_raw, guild_id,
+            )
+            return
+        if posted_at < state_changed_at:
             return
 
         # 10) Fire reveal — CAS-lock FIRST with placeholder reveal_post_id,

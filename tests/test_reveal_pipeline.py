@@ -107,6 +107,27 @@ def _seed_score(db_conn, **overrides) -> None:
     upsert_score_success(db_conn, **kwargs)
 
 
+def _backdate_state_change(db_conn, guild_id: str, hours_ago: int) -> None:
+    """Backdate discord_scoring_config.state_changed_at so a test post
+    seeded as "1 hour ago" satisfies the design-§8.3 `posted_at >=
+    state_changed_at` floor. Without this, set_state() stamps
+    state_changed_at to wall-clock-now, which is AFTER any back-dated
+    posted_at and the reveal-fire gate (correctly) blocks the reveal.
+    """
+    import sqlalchemy as _sa
+    older = (datetime.now(timezone.utc) - timedelta(hours=hours_ago)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    db_conn.execute(
+        _sa.text(
+            "UPDATE discord_scoring_config"
+            " SET state_changed_at = :older WHERE guild_id = :gid"
+        ),
+        {"older": older, "gid": guild_id},
+    )
+    db_conn.commit()
+
+
 def _make_reaction(*, emoji: str, reactor_ids: list[int]) -> SimpleNamespace:
     """Build a discord.Reaction stub. reactor_ids are user.id values.
 
@@ -398,6 +419,7 @@ async def test_revealed_state_fires_reveal_at_10_unique_reactors(
     rp_module, db_conn, monkeypatch
 ):
     set_state(db_conn, org_id="solstitch", guild_id="100", state="revealed", updated_by="ADMIN")
+    _backdate_state_change(db_conn, "100", hours_ago=2)
     kwargs = _success_score_kwargs(post_id="900", user_id="555", percentile=87.0)
     one_hour_ago = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
     kwargs["posted_at"] = one_hour_ago
@@ -884,6 +906,150 @@ async def test_low_age_dedup_blocks_second_audit_same_pair(
 
 
 # ---------------------------------------------------------------------------
+# §8.3 strict: silent-period posts never reveal post-flip
+# ---------------------------------------------------------------------------
+
+
+async def test_pre_revealed_flip_post_does_not_reveal_after_flip(
+    rp_module, db_conn, monkeypatch
+):
+    """A fit scored under SILENT whose 10th reactor lands AFTER a
+    Silent → Revealed flip MUST NOT reveal. Implements design §8.3
+    "Reveals only on fits posted *after* the transition."
+
+    Tested by seeding the post 2 hours ago, flipping to revealed NOW
+    (so state_changed_at > posted_at), then triggering a recompute with
+    10 reactors. Reveal must NOT fire; milestones DO fire.
+    """
+    # 1) Seed score in silent mode, posted_at = 2 hours ago.
+    set_state(db_conn, org_id="solstitch", guild_id="100", state="silent", updated_by="ADMIN")
+    two_hours_ago = (datetime.now(timezone.utc) - timedelta(hours=2)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    kwargs = _success_score_kwargs(post_id="900", user_id="555", percentile=87.0)
+    kwargs["posted_at"] = two_hours_ago
+    upsert_streak_event(
+        db_conn, "solstitch", "100", "200", "900", "555",
+        two_hours_ago, "2026-05-12", 1, 1,
+    )
+    upsert_score_success(db_conn, **kwargs)
+
+    # 2) Flip to revealed NOW — state_changed_at is now (post-posted_at).
+    set_state(db_conn, org_id="solstitch", guild_id="100", state="revealed", updated_by="ADMIN")
+
+    # 3) 10 reactors. Threshold trips; reveal MUST NOT fire (pre-flip post).
+    reaction = _make_reaction(emoji="🔥", reactor_ids=list(range(11_001, 11_011)))
+    message = _make_message_stub(post_id=900, author_id=555, reactions=[reaction])
+    client = _make_client_with_message(message)
+    monkeypatch.setattr(rp_module, "_client", client)
+
+    await rp_module._recompute_after_delay(
+        guild_id="100", post_id=900, channel_id=200,
+    )
+
+    # Crucial: no reply, no reveal_fired_at on the row.
+    message.reply.assert_not_called()
+    row = db_conn.execute(
+        text("SELECT reveal_fired_at FROM discord_fitcheck_scores WHERE post_id = '900'")
+    ).fetchone()
+    assert row["reveal_fired_at"] is None
+    # But milestones DID fire (calibration signals run in both states).
+    milestones = db_conn.execute(
+        text(
+            "SELECT COUNT(*) AS n FROM discord_fitcheck_emoji_milestones"
+            " WHERE post_id = '900'"
+        )
+    ).fetchone()
+    assert milestones["n"] >= 1  # at least the 5-milestone, probably 5+8+10
+
+
+async def test_post_flip_post_does_reveal(rp_module, db_conn, monkeypatch):
+    """The symmetric positive case: a post made AFTER the Silent→Revealed
+    transition DOES reveal at threshold.
+    """
+    # 1) Flip to revealed FIRST + backdate state_changed_at so the test's
+    # back-dated posted_at lands AFTER the transition.
+    set_state(db_conn, org_id="solstitch", guild_id="100", state="silent", updated_by="ADMIN")
+    set_state(db_conn, org_id="solstitch", guild_id="100", state="revealed", updated_by="ADMIN")
+    _backdate_state_change(db_conn, "100", hours_ago=1)
+
+    thirty_min_ago = (datetime.now(timezone.utc) - timedelta(minutes=30)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    kwargs = _success_score_kwargs(post_id="901", user_id="555", percentile=87.0)
+    kwargs["posted_at"] = thirty_min_ago
+    upsert_streak_event(
+        db_conn, "solstitch", "100", "200", "901", "555",
+        thirty_min_ago, "2026-05-12", 1, 1,
+    )
+    upsert_score_success(db_conn, **kwargs)
+
+    reaction = _make_reaction(emoji="🔥", reactor_ids=list(range(12_001, 12_011)))
+    message = _make_message_stub(post_id=901, author_id=555, reactions=[reaction])
+    client = _make_client_with_message(message)
+    monkeypatch.setattr(rp_module, "_client", client)
+
+    await rp_module._recompute_after_delay(
+        guild_id="100", post_id=901, channel_id=200,
+    )
+
+    # Post-flip post: reveal MUST fire.
+    message.reply.assert_awaited_once()
+    row = db_conn.execute(
+        text("SELECT reveal_fired_at, reveal_trigger FROM discord_fitcheck_scores WHERE post_id = '901'")
+    ).fetchone()
+    assert row["reveal_fired_at"] is not None
+    assert row["reveal_trigger"] == "reactions"
+
+
+async def test_revealed_state_with_null_state_changed_at_fails_closed(
+    rp_module, db_conn, monkeypatch
+):
+    """Defensive case: live state is 'revealed' but state_changed_at is
+    NULL (data inconsistency — shouldn't happen via the supported state-
+    transition path). Reveal must fail-closed; no publish, log a warning.
+    """
+    # Hand-craft an inconsistent config row: state='revealed' but
+    # state_changed_at NULL. Bypasses set_state which always populates it.
+    import sqlalchemy as _sa
+    db_conn.execute(
+        _sa.text(
+            "INSERT INTO discord_scoring_config"
+            " (org_id, guild_id, state, state_changed_at, state_changed_by)"
+            " VALUES ('solstitch', '100', 'revealed', NULL, NULL)"
+        )
+    )
+    db_conn.commit()
+
+    one_hour_ago = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    kwargs = _success_score_kwargs(post_id="900", user_id="555")
+    kwargs["posted_at"] = one_hour_ago
+    upsert_streak_event(
+        db_conn, "solstitch", "100", "200", "900", "555",
+        one_hour_ago, "2026-05-12", 1, 1,
+    )
+    upsert_score_success(db_conn, **kwargs)
+
+    reaction = _make_reaction(emoji="🔥", reactor_ids=list(range(13_001, 13_011)))
+    message = _make_message_stub(post_id=900, author_id=555, reactions=[reaction])
+    client = _make_client_with_message(message)
+    monkeypatch.setattr(rp_module, "_client", client)
+
+    await rp_module._recompute_after_delay(
+        guild_id="100", post_id=900, channel_id=200,
+    )
+
+    # Fail-closed: no reply, no reveal_fired_at.
+    message.reply.assert_not_called()
+    row = db_conn.execute(
+        text("SELECT reveal_fired_at FROM discord_fitcheck_scores WHERE post_id = '900'")
+    ).fetchone()
+    assert row["reveal_fired_at"] is None
+
+
+# ---------------------------------------------------------------------------
 # Publish-failure paths — C1 + C2 + H1 + M7 coverage
 # ---------------------------------------------------------------------------
 
@@ -899,6 +1065,7 @@ async def test_reveal_publish_404_routes_to_cancelled_deleted_HIGH_audit(
     silently swallowed by the CAS racing the delete handler.
     """
     set_state(db_conn, org_id="solstitch", guild_id="100", state="revealed", updated_by="ADMIN")
+    _backdate_state_change(db_conn, "100", hours_ago=2)
     kwargs = _success_score_kwargs(post_id="900", user_id="555")
     one_hour_ago = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
     kwargs["posted_at"] = one_hour_ago
@@ -962,6 +1129,7 @@ async def test_reveal_publish_5xx_routes_to_publish_failed(
     in place (no retry) so the next eligible recompute short-circuits.
     """
     set_state(db_conn, org_id="solstitch", guild_id="100", state="revealed", updated_by="ADMIN")
+    _backdate_state_change(db_conn, "100", hours_ago=2)
     kwargs = _success_score_kwargs(post_id="900", user_id="555")
     one_hour_ago = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
     kwargs["posted_at"] = one_hour_ago
@@ -1024,6 +1192,7 @@ async def test_reveal_publish_success_uses_allowed_mentions_none(
     the body content.
     """
     set_state(db_conn, org_id="solstitch", guild_id="100", state="revealed", updated_by="ADMIN")
+    _backdate_state_change(db_conn, "100", hours_ago=2)
     kwargs = _success_score_kwargs(post_id="900", user_id="555", percentile=87.0)
     one_hour_ago = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
     kwargs["posted_at"] = one_hour_ago
@@ -1071,6 +1240,7 @@ async def test_reveal_finalises_post_id_via_update_helper(
     terminal).
     """
     set_state(db_conn, org_id="solstitch", guild_id="100", state="revealed", updated_by="ADMIN")
+    _backdate_state_change(db_conn, "100", hours_ago=2)
     kwargs = _success_score_kwargs(post_id="900", user_id="555", percentile=87.0)
     one_hour_ago = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
     kwargs["posted_at"] = one_hour_ago
