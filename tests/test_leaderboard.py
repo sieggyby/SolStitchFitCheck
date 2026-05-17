@@ -258,7 +258,13 @@ def test_format_leaderboard_stays_under_discord_2000_char_limit():
 
 def test_format_leaderboard_truncation_notice_when_rows_dropped():
     """VR2-M2: when body cap kicks in and rows are dropped, the user
-    must see a truncation notice — silent drop would be confusing."""
+    must see a truncation notice — silent drop would be confusing.
+
+    VR3-L3: assertions are unconditional. The fixture is intentionally
+    worst-case (10 rows × 80-char catches × 64-char names × 19-digit IDs);
+    if this stops triggering truncation in the future the fixture has
+    regressed and the test should fail loudly.
+    """
     rows = []
     names = {}
     for i in range(10):
@@ -279,10 +285,45 @@ def test_format_leaderboard_truncation_notice_when_rows_dropped():
     out = leaderboard._format_leaderboard(
         rows, names, board="top_revealed", window="all_time", public=False
     )
-    # If we DID drop rows (worst-case), the truncation marker is visible.
-    if "showing" in out.lower():
-        assert "of 10" in out
-        assert "discord" in out.lower()
+    assert "showing" in out.lower()
+    assert "of 10" in out
+    assert "discord" in out.lower()
+
+
+def test_format_leaderboard_no_marker_when_all_rows_fit():
+    """VR3-L1: a board that fits entirely under the budget must NOT
+    show a truncation notice. The over-reservation bug would have
+    dropped row 10 unnecessarily; verify the two-pass packing keeps
+    all rows when they all fit.
+    """
+    # Realistic-corpus entries: 12-char name + 40-char catch + 19-digit
+    # snowflakes. Per-entry ≈ 4 + 12 + 3 + 2 + 11 + 40 + 5 + 88 = 165 chars.
+    # 10 entries = 1650 + header (~45) + footer (~110) = ~1805 chars,
+    # within MAX_BODY_CHARS=1900 — all rows should fit, no marker.
+    rows = []
+    names = {}
+    for i in range(10):
+        uid = str(1000000000000000000 + i)
+        rows.append({
+            "guild_id": "1501026101730869290",
+            "channel_id": "1501073373252292709",
+            "post_id": str(1505000000000000000 + i),
+            "user_id": uid,
+            "percentile": 99.0 - i,
+            "catch_detected": "x" * 40,  # realistic catch length
+            "reveal_fired_at": "2026-05-17T12:00:00Z",
+            "reveal_trigger": "reactions",
+            "posted_at": "2026-05-17T11:55:00Z",
+        })
+        names[uid] = "n" * 12  # realistic display name
+
+    out = leaderboard._format_leaderboard(
+        rows, names, board="top_revealed", window="all_time", public=False
+    )
+    # All 10 rows present + NO truncation marker.
+    assert "showing" not in out.lower()
+    for i in range(10):
+        assert str(1505000000000000000 + i) in out, f"row {i} missing"
 
 
 # ---------------------------------------------------------------------------
@@ -671,6 +712,30 @@ async def test_callback_drops_rows_with_null_channel_id(monkeypatch):
     assert "p2" not in args[0]
     # Good post_id present.
     assert "chan_1/p1" in args[0]
+
+
+@pytest.mark.asyncio
+async def test_callback_all_rows_filtered_renders_empty(monkeypatch):
+    """VR3-L4: when EVERY row from the DB is L6-filtered (all orphans),
+    the rendered output should be the empty-board text — same as if
+    the DB returned nothing. No crash, no half-rendered leaderboard.
+    """
+    monkeypatch.setattr(leaderboard, "GUILD_TO_ORG", {"100": "solstitch"})
+    rows = [
+        _row("p1", "1111", 90.0, channel_id=None),
+        _row("p2", "2222", 80.0, channel_id=None),
+    ]
+    with patch.object(
+        leaderboard.discord_fitcheck_scores,
+        "list_top_revealed_fits",
+        return_value=rows,
+    ):
+        cmd = _build_tree_with_leaderboard()
+        interaction = _make_interaction()
+        await cmd.callback(interaction)
+
+    args, _ = interaction.followup.send.call_args
+    assert args[0] == leaderboard.EMPTY_BOARD_TEXT
 
 
 @pytest.mark.asyncio

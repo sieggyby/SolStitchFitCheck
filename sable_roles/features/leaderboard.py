@@ -146,12 +146,12 @@ def _format_leaderboard(
     the caller toward `window:all_time` so they don't assume the whole
     leaderboard is empty when they just don't have recent activity.
 
-    VR2-M2: budgets the body under MAX_BODY_CHARS (1900) by adding rows
-    only while the running total fits. If any rows are dropped, appends
-    "(showing N of M — top rows fit Discord's message length)" so the
-    user knows the list is truncated. Discord rejects messages > 2000
-    chars with HTTP 400; this guard makes the leaderboard length-safe
-    without an arbitrary per-field cap.
+    VR2-M2 / VR3-L1: budgets the body under MAX_BODY_CHARS (1900). Two-pass:
+    first pass with full budget assumes no truncation; if all rows fit, no
+    reserve needed. If a row gets dropped, the 80-char truncation marker is
+    appended and counted retroactively — preventing the over-reservation
+    that would otherwise truncate a fits-exactly board to N-1 rows.
+    Discord rejects messages > 2000 chars with HTTP 400.
     """
     if not rows:
         if window == "30d":
@@ -170,12 +170,17 @@ def _format_leaderboard(
             " · /leaderboard public:true to share)"
         )
 
-    # Reserve header + footer + worst-case truncation marker (~80 chars).
-    fixed_overhead = len(header) + 1 + len(footer) + 80
-    budget = MAX_BODY_CHARS - fixed_overhead
+    # Precompute the truncation marker so we know exactly how much to
+    # reserve when it actually fires.
+    def _truncation_marker(shown: int, total: int) -> str:
+        return (
+            f"\n\n(showing {shown} of {total}"
+            " — top rows fit Discord's message length)"
+        )
 
-    entries: list[str] = []
-    used = 0
+    # Render every entry once, then pack against the budget. Two-pass
+    # avoids paying the truncation-marker reserve on a board that fits.
+    rendered: list[str] = []
     for i, row in enumerate(rows, start=1):
         uid = str(row["user_id"])
         name = display_names.get(uid, f"unknown ({uid[:8]})")
@@ -184,30 +189,48 @@ def _format_leaderboard(
             str(row["channel_id"]) if row.get("channel_id") else None,
             str(row["post_id"]),
         )
-        entry = _format_entry(
-            rank=i,
-            display_name=name,
-            percentile=float(row["percentile"]),
-            catch=row.get("catch_detected"),
-            jump_link=jump,
+        rendered.append(
+            _format_entry(
+                rank=i,
+                display_name=name,
+                percentile=float(row["percentile"]),
+                catch=row.get("catch_detected"),
+                jump_link=jump,
+            )
         )
-        # +1 for the joining newline once we have more than one entry.
+
+    # Pack assuming no truncation first.
+    fixed_overhead_no_truncation = len(header) + 1 + len(footer)
+    budget_no_truncation = MAX_BODY_CHARS - fixed_overhead_no_truncation
+
+    entries: list[str] = []
+    used = 0
+    for entry in rendered:
         candidate = used + len(entry) + (1 if entries else 0)
-        if candidate > budget:
+        if candidate > budget_no_truncation:
+            break
+        entries.append(entry)
+        used = candidate
+
+    if len(entries) == len(rendered):
+        # Everything fit — no truncation marker needed, return as-is.
+        return header + "\n" + "\n".join(entries) + footer
+
+    # Truncation will fire. Re-pack with the marker reserved.
+    marker_worst = len(_truncation_marker(len(rendered), len(rendered)))
+    budget_with_truncation = budget_no_truncation - marker_worst
+    entries = []
+    used = 0
+    for entry in rendered:
+        candidate = used + len(entry) + (1 if entries else 0)
+        if candidate > budget_with_truncation:
             break
         entries.append(entry)
         used = candidate
 
     body = "\n".join(entries)
-
-    truncation_note = ""
-    if len(entries) < len(rows):
-        truncation_note = (
-            f"\n\n(showing {len(entries)} of {len(rows)}"
-            " — top rows fit Discord's message length)"
-        )
-
-    return header + "\n" + body + truncation_note + footer
+    marker = _truncation_marker(len(entries), len(rendered))
+    return header + "\n" + body + marker + footer
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +258,12 @@ def _evict_cooldown_if_full() -> None:
     L3 from Pass D QA round 1: bot-user self-throttle is not reachable
     — Discord doesn't deliver INTERACTION_CREATE to bot users invoking
     slash commands, so `interaction.user.id` is always a human.
+
+    VR3-L2: precedent comparison: reveal_pipeline._PENDING_REVEALS uses
+    pre-insert eviction with `>=`. Same FIFO-bounded-dict intent, opposite
+    phase. Both individually correct (the predicate matches the insertion
+    point); the choice here is post-insert + `>` because callers do the
+    set unconditionally and the evict helper runs second.
     """
     if len(_INVOKE_COOLDOWN) > _COOLDOWN_CAP:
         oldest = next(iter(_INVOKE_COOLDOWN))
