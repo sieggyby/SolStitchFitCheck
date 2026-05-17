@@ -51,6 +51,19 @@ logger = logging.getLogger("sable_roles.image_hashing")
 _IMAGE_BYTE_CAP = 10 * 1024 * 1024
 
 
+def _coerce_audit_value(v):
+    """Coerce a column value to JSON-safe form for audit detail dicts.
+
+    Specifically guards against the discord_streak_events.posted_at column
+    being TIMESTAMPTZ on the VPS Postgres (pre-Scored-Mode-era schema drift
+    vs. schema.py which declares TEXT). When a datetime falls into a detail
+    dict, json.dumps raises and the entire audit + caller path unwinds.
+    """
+    if isinstance(v, datetime):
+        return v.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return v
+
+
 def compute_phash_from_bytes(image_bytes: bytes) -> str:
     """Return pHash hex string for image_bytes.
 
@@ -222,9 +235,9 @@ async def maybe_record_phash(
                         "post_id": post_id_str,
                         "user_id": author_id_str,
                         "phash": phash,
-                        "matched_post_id": cand.get("post_id"),
-                        "matched_user_id": cand.get("user_id"),
-                        "matched_posted_at": cand.get("posted_at"),
+                        "matched_post_id": _coerce_audit_value(cand.get("post_id")),
+                        "matched_user_id": _coerce_audit_value(cand.get("user_id")),
+                        "matched_posted_at": _coerce_audit_value(cand.get("posted_at")),
                         "hamming_distance": dist,
                     },
                     source="sable-roles",

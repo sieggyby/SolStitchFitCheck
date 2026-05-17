@@ -536,6 +536,16 @@ async def maybe_score_fit(
         )
         rationales_json = json.dumps(parsed["axis_rationales"])
 
+        # Pull usage so the audit row carries token + cost telemetry.
+        # log_cost() (called below) loses cache breakdown; audit captures it.
+        usage_in = getattr(response.usage, "input_tokens", 0) or 0
+        usage_out = getattr(response.usage, "output_tokens", 0) or 0
+        usage_cache_read = getattr(response.usage, "cache_read_input_tokens", 0) or 0
+        usage_cache_write = getattr(response.usage, "cache_creation_input_tokens", 0) or 0
+        usage_cost = _compute_cost_per_million(
+            model_id, usage_in, usage_out, usage_cache_read, usage_cache_write
+        )
+
         with get_db() as conn:
             discord_fitcheck_scores.upsert_score_success(
                 conn,
@@ -586,6 +596,13 @@ async def maybe_score_fit(
                     "catch_naming_class": catch_naming_class,
                     "confidence": confidence,
                     "state": cfg["state"],
+                    "usage": {
+                        "input_tokens": usage_in,
+                        "output_tokens": usage_out,
+                        "cache_read_tokens": usage_cache_read,
+                        "cache_creation_tokens": usage_cache_write,
+                        "cost_usd": usage_cost,
+                    },
                 },
                 source="sable-roles",
             )
@@ -620,21 +637,21 @@ def _log_cost_safe(
         cost = _compute_cost_per_million(
             model_id, in_tok, out_tok, cache_read, cache_write
         )
+        # log_cost helper doesn't accept a `detail` kwarg — its narrow
+        # signature is (conn, org_id, call_type, cost_usd, model, input_tokens,
+        # output_tokens, call_status, job_id). Cache breakdown is folded
+        # into input_tokens (a single accurate total) and survives in the
+        # cost_usd calculation above. Per-call cache split for telemetry
+        # lives in the audit_log row (`fitcheck_score_recorded` detail).
         with get_db() as conn:
             log_cost(
                 conn,
                 org_id=org_id,
                 call_type="sable_roles_fitcheck_score",
                 cost_usd=cost,
-                detail={
-                    "guild_id": guild_id,
-                    "post_id": post_id_str,
-                    "model_id": model_id,
-                    "input_tokens": in_tok,
-                    "output_tokens": out_tok,
-                    "cache_read_tokens": cache_read,
-                    "cache_creation_tokens": cache_write,
-                },
+                model=model_id,
+                input_tokens=in_tok + cache_read + cache_write,
+                output_tokens=out_tok,
             )
     except Exception as exc:  # noqa: BLE001
         logger.info("scoring cost log failed: %s", exc)
