@@ -602,3 +602,62 @@ async def test_scoring_set_confirm_view_blocks_other_users():
     ok = await view.interaction_check(foreign_interaction)
     assert ok is False
     foreign_interaction.response.send_message.assert_awaited_once()
+
+
+async def test_scoring_set_confirm_view_on_timeout_disables_buttons():
+    """Pass A+B QA round-2 polish: on_timeout must disable view children so
+    a late click doesn't fire stale state.
+    """
+    from sable_roles.features.scoring_pipeline import _ScoringSetConfirmView
+
+    view = _ScoringSetConfirmView(
+        invoker_user_id=555,
+        org_id="solstitch",
+        guild_id="100",
+        target_state="silent",
+        current_state="off",
+    )
+    # Pre-timeout: at least one child has disabled=False.
+    assert any(getattr(c, "disabled", True) is False for c in view.children)
+    await view.on_timeout()
+    for child in view.children:
+        if hasattr(child, "disabled"):
+            assert child.disabled is True
+
+
+async def test_scoring_set_confirm_view_db_error_surfaces_gracefully(sp_module, db_conn):
+    """Pass A+B QA round-2 polish: a DB error during set_state must NOT
+    crash; the user sees a 'try again' message and state stays unchanged.
+    """
+    from sable_roles.features import scoring_pipeline as sp
+    from sable_platform.db import discord_scoring_config
+
+    view = sp._ScoringSetConfirmView(
+        invoker_user_id=555,
+        org_id="solstitch",
+        guild_id="100",
+        target_state="silent",
+        current_state="off",
+    )
+
+    interaction = MagicMock()
+    interaction.user = SimpleNamespace(id=555)
+    interaction.response = MagicMock()
+    interaction.response.edit_message = AsyncMock()
+
+    # Force set_state to raise. The view should catch + edit gracefully.
+    def _boom(*args, **kwargs):
+        raise RuntimeError("simulated DB error")
+
+    # set_state is imported into the scoring_pipeline module via the
+    # discord_scoring_config submodule reference; patch it there.
+    import unittest.mock as um
+    with um.patch.object(discord_scoring_config, "set_state", side_effect=_boom):
+        # Locate Confirm button callback. Discord UI buttons live in view.children.
+        confirm_btn = next(c for c in view.children if getattr(c, "label", None) == "Confirm")
+        await confirm_btn.callback(interaction)
+
+    # Graceful error edit fired with a "try again" body.
+    interaction.response.edit_message.assert_awaited_once()
+    edit_kwargs = interaction.response.edit_message.await_args.kwargs
+    assert "try again" in (edit_kwargs.get("content") or "").lower()

@@ -30,16 +30,10 @@ Cost note: prompt caching is set on the system block per
 ~/Projects/SolStitch/internal/fitcheck_scored_mode_plan.md sec 5.1 — the
 rubric is static across all calls so cache hits drive cost ~$0.008/fit.
 
-Scope note (Pass C deferral):
-- `fitcheck_reaction_milestone` (5/8/10 reactions on a single emoji) and
-  `fitcheck_low_age_reactor` (< 30d Discord account age) are listed in
-  the design's §6.4 audit catalog and §7.3 reactor account-age capture.
-  Pass A+B does NOT emit these — they are semantically reveal-adjacent
-  (the 10-reactor threshold is the reveal trigger Pass C will own), and
-  implementing them cleanly requires per-(post_id, emoji) crossing state
-  the V1 streak schema doesn't track. Plan to land them with Pass C
-  alongside the reveal-eligibility tracker. Mods grepping audit log
-  before Pass C ships should not expect these rows.
+Pass C (shipped): `reveal_pipeline.py` owns the reveal-eligibility recompute,
+the per-emoji milestone emission (`fitcheck_reaction_milestone`), the low-age
+reactor audit (`fitcheck_low_age_reactor`), the publish-on-trigger surface,
+and the cancel-on-delete `fitcheck_reveal_cancelled_deleted` audit.
 """
 from __future__ import annotations
 
@@ -696,22 +690,60 @@ class _ScoringSetConfirmView(discord.ui.View):
             return False
         return True
 
+    async def on_timeout(self) -> None:
+        """Disable buttons when the 60s window expires.
+
+        discord.py 2.x can't edit the ephemeral message post-timeout without
+        a fresh interaction handle (the original token has lapsed). We disable
+        the View children defensively — if a late click comes in, the
+        disabled-state stops the callback from firing AT THE VIEW LAYER and
+        Discord surfaces its generic "interaction failed" toast instead of
+        running confirm() against a stale state machine. Pass A+B QA round-2
+        non-blocking polish item.
+        """
+        for child in self.children:
+            if hasattr(child, "disabled"):
+                child.disabled = True
+
     @discord.ui.button(label="Confirm", style=discord.ButtonStyle.danger)
     async def confirm(
         self,
         interaction: discord.Interaction,
         button: discord.ui.Button,
     ) -> None:
-        with get_db() as conn:
-            cfg = discord_scoring_config.set_state(
-                conn,
-                org_id=self._org_id,
-                guild_id=self._guild_id,
-                state=self._target_state,
-                updated_by=str(interaction.user.id),
-            )
         for child in self.children:
             child.disabled = True
+        try:
+            with get_db() as conn:
+                cfg = discord_scoring_config.set_state(
+                    conn,
+                    org_id=self._org_id,
+                    guild_id=self._guild_id,
+                    state=self._target_state,
+                    updated_by=str(interaction.user.id),
+                )
+        except Exception as exc:  # noqa: BLE001
+            # DB error during state write — log + tell the mod to retry.
+            # Pass A+B QA round-2 non-blocking polish item. Default house style
+            # is "let it crash + journalctl"; for an ephemeral interaction the
+            # crash is invisible to the user, so the graceful surface adds
+            # operator clarity without obscuring the failure in logs.
+            logger.warning(
+                "scoring set_state DB write failed for guild %s -> %s",
+                self._guild_id, self._target_state, exc_info=exc,
+            )
+            try:
+                await interaction.response.edit_message(
+                    content=(
+                        "couldn't write state — DB error. try again in a moment.\n"
+                        "(state unchanged.)"
+                    ),
+                    view=self,
+                )
+            except discord.HTTPException:
+                pass
+            self.stop()
+            return
         await interaction.response.edit_message(
             content=(
                 f"scored mode is now **{cfg['state']}** for this guild.\n"

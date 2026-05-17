@@ -23,6 +23,7 @@ from sable_roles.features import (
     burn_me,
     delete_monitor,
     fitcheck_streak,
+    reveal_pipeline,
     roast,
     scoring_pipeline,
     vibe_observer,
@@ -69,6 +70,11 @@ class SableRolesClient(discord.Client):
         # `off` per migration 051 default — no scoring fires until a mod
         # explicitly runs `/scoring action:set state:silent`.
         scoring_pipeline.register_commands(self.tree, client=self)
+        # Scored Mode V2 Pass C: reveal pipeline. Composes with all
+        # prior reaction / message / delete handlers — MUST register LAST
+        # so the wrap-existing pattern preserves every earlier binding.
+        # No-op until per-guild scoring state is 'revealed' (default 'off').
+        reveal_pipeline.register(self)
         # Per-guild instant sync via copy_global_to (SableTracking pattern).
         for guild_id_str in GUILD_TO_ORG:
             guild = discord.Object(id=int(guild_id_str))
@@ -104,6 +110,7 @@ class SableRolesClient(discord.Client):
         # Graceful drain. Client.close() is discord.py 2.x's documented shutdown hook.
         vibe_observer.stop_tasks()
         await fitcheck_streak.close()
+        await reveal_pipeline.close()
         await super().close()
 
 
