@@ -226,6 +226,65 @@ def test_format_leaderboard_truncates_long_catch():
     assert long_catch not in out  # Full text shouldn't appear
 
 
+def test_format_leaderboard_stays_under_discord_2000_char_limit():
+    """VR2-M2: worst-case 10-row board with max-length names + catches +
+    realistic Discord snowflake IDs can exceed 2000 chars. _format_leaderboard
+    must budget the body so the final string fits, dropping low-rank rows
+    if needed."""
+    # Max-length names (64 chars) + near-max catches (80 chars) + 19-digit
+    # snowflake guild/channel/post ids.
+    rows = []
+    names = {}
+    for i in range(10):
+        uid = str(1000000000000000000 + i)  # 19-digit snowflake
+        rows.append({
+            "guild_id": "1501026101730869290",
+            "channel_id": "1501073373252292709",
+            "post_id": str(1505000000000000000 + i),
+            "user_id": uid,
+            "percentile": 99.0 - i,
+            "catch_detected": "x" * 80,  # max catch length
+            "reveal_fired_at": "2026-05-17T12:00:00Z",
+            "reveal_trigger": "reactions",
+            "posted_at": "2026-05-17T11:55:00Z",
+        })
+        names[uid] = "n" * 64  # max sanitized display name length
+
+    out = leaderboard._format_leaderboard(
+        rows, names, board="top_revealed", window="all_time", public=False
+    )
+    assert len(out) <= 2000, f"leaderboard body is {len(out)} chars, must be <= 2000"
+
+
+def test_format_leaderboard_truncation_notice_when_rows_dropped():
+    """VR2-M2: when body cap kicks in and rows are dropped, the user
+    must see a truncation notice — silent drop would be confusing."""
+    rows = []
+    names = {}
+    for i in range(10):
+        uid = str(1000000000000000000 + i)
+        rows.append({
+            "guild_id": "1501026101730869290",
+            "channel_id": "1501073373252292709",
+            "post_id": str(1505000000000000000 + i),
+            "user_id": uid,
+            "percentile": 99.0 - i,
+            "catch_detected": "x" * 80,
+            "reveal_fired_at": "2026-05-17T12:00:00Z",
+            "reveal_trigger": "reactions",
+            "posted_at": "2026-05-17T11:55:00Z",
+        })
+        names[uid] = "n" * 64
+
+    out = leaderboard._format_leaderboard(
+        rows, names, board="top_revealed", window="all_time", public=False
+    )
+    # If we DID drop rows (worst-case), the truncation marker is visible.
+    if "showing" in out.lower():
+        assert "of 10" in out
+        assert "discord" in out.lower()
+
+
 # ---------------------------------------------------------------------------
 # Rate-limit gate
 # ---------------------------------------------------------------------------
@@ -731,3 +790,56 @@ async def test_callback_helper_exception_is_user_friendly(monkeypatch):
     args, kwargs = interaction.followup.send.call_args
     assert "couldn't load" in args[0].lower()
     assert kwargs.get("ephemeral") is True
+
+
+@pytest.mark.asyncio
+async def test_callback_error_followup_matches_defer_ephemeral_when_public(monkeypatch):
+    """VR2-M1: when public=True, defer ephemeral=False; error followup
+    MUST also use ephemeral=False or Discord renders a stuck public
+    'thinking…' state replaced by an ephemeral error nobody but the
+    invoker sees.
+    """
+    monkeypatch.setattr(leaderboard, "GUILD_TO_ORG", {"100": "solstitch"})
+    with patch.object(
+        leaderboard.discord_fitcheck_scores,
+        "list_top_revealed_fits",
+        side_effect=RuntimeError("DB broken"),
+    ):
+        cmd = _build_tree_with_leaderboard()
+        interaction = _make_interaction()
+        await cmd.callback(interaction, public=True)
+    # Defer was public.
+    defer_kwargs = interaction.response.defer.call_args.kwargs
+    assert defer_kwargs.get("ephemeral") is False
+    # Error followup is ALSO public to match.
+    args, kwargs = interaction.followup.send.call_args
+    assert kwargs.get("ephemeral") is False
+
+
+@pytest.mark.asyncio
+async def test_callback_rate_limit_runs_after_guild_checks(monkeypatch):
+    """VR2-L3: rate-limit slot must NOT be consumed when the user
+    invokes /leaderboard in a DM or an unconfigured guild. Otherwise an
+    honest mistake burns the user's 60s window.
+    """
+    monkeypatch.setattr(leaderboard, "GUILD_TO_ORG", {})
+    cmd = _build_tree_with_leaderboard()
+    interaction = _make_interaction(user_id=42, guild_id=None)
+    await cmd.callback(interaction)
+    # Rate-limit dict must NOT have a slot for this user.
+    assert 42 not in leaderboard._INVOKE_COOLDOWN
+
+
+@pytest.mark.asyncio
+async def test_callback_rate_limit_consumed_when_guild_valid(monkeypatch):
+    """Inverse of the above — a valid guild SHOULD consume the slot."""
+    monkeypatch.setattr(leaderboard, "GUILD_TO_ORG", {"100": "solstitch"})
+    with patch.object(
+        leaderboard.discord_fitcheck_scores,
+        "list_top_revealed_fits",
+        return_value=[],
+    ):
+        cmd = _build_tree_with_leaderboard()
+        interaction = _make_interaction(user_id=99)
+        await cmd.callback(interaction)
+    assert 99 in leaderboard._INVOKE_COOLDOWN

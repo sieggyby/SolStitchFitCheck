@@ -62,6 +62,14 @@ EMPTY_BOARD_TEXT_30D = (
     "no revealed fits in the last 30 days — try `/leaderboard window:all_time`."
 )
 
+# VR2-M2: Discord rejects message bodies > 2000 chars with HTTP 400. A
+# worst-case 10-row leaderboard (64-char name + 80-char catch + 88-char
+# jump link per row) lands around ~2300 chars, occasionally over the
+# limit. Budget the body: header + footer reserved, then add rows while
+# under MAX_BODY_CHARS, and append a truncation notice if any rows were
+# dropped.
+MAX_BODY_CHARS = 1900  # safety margin below Discord's 2000 hard cap
+
 
 # ---------------------------------------------------------------------------
 # Pure helpers (testable without a Discord client)
@@ -137,6 +145,13 @@ def _format_leaderboard(
     L5 (Pass D QA round 1): when rows is empty AND window is 30d, hint
     the caller toward `window:all_time` so they don't assume the whole
     leaderboard is empty when they just don't have recent activity.
+
+    VR2-M2: budgets the body under MAX_BODY_CHARS (1900) by adding rows
+    only while the running total fits. If any rows are dropped, appends
+    "(showing N of M — top rows fit Discord's message length)" so the
+    user knows the list is truncated. Discord rejects messages > 2000
+    chars with HTTP 400; this guard makes the leaderboard length-safe
+    without an arbitrary per-field cap.
     """
     if not rows:
         if window == "30d":
@@ -147,7 +162,20 @@ def _format_leaderboard(
     window_label = "all-time" if window == "all_time" else "last 30 days"
     header = f"**{header_label} — #fitcheck — {window_label}**\n"
 
-    entries = []
+    if public:
+        footer = "\n\n(/leaderboard window:30d for last 30 days)"
+    else:
+        footer = (
+            "\n\n(ephemeral · /leaderboard window:30d for last 30 days"
+            " · /leaderboard public:true to share)"
+        )
+
+    # Reserve header + footer + worst-case truncation marker (~80 chars).
+    fixed_overhead = len(header) + 1 + len(footer) + 80
+    budget = MAX_BODY_CHARS - fixed_overhead
+
+    entries: list[str] = []
+    used = 0
     for i, row in enumerate(rows, start=1):
         uid = str(row["user_id"])
         name = display_names.get(uid, f"unknown ({uid[:8]})")
@@ -156,26 +184,30 @@ def _format_leaderboard(
             str(row["channel_id"]) if row.get("channel_id") else None,
             str(row["post_id"]),
         )
-        entries.append(
-            _format_entry(
-                rank=i,
-                display_name=name,
-                percentile=float(row["percentile"]),
-                catch=row.get("catch_detected"),
-                jump_link=jump,
-            )
+        entry = _format_entry(
+            rank=i,
+            display_name=name,
+            percentile=float(row["percentile"]),
+            catch=row.get("catch_detected"),
+            jump_link=jump,
         )
+        # +1 for the joining newline once we have more than one entry.
+        candidate = used + len(entry) + (1 if entries else 0)
+        if candidate > budget:
+            break
+        entries.append(entry)
+        used = candidate
 
     body = "\n".join(entries)
 
-    if public:
-        footer = "\n\n(/leaderboard window:30d for last 30 days)"
-    else:
-        footer = (
-            "\n\n(ephemeral · /leaderboard window:30d for last 30 days"
-            " · /leaderboard public:true to share)"
+    truncation_note = ""
+    if len(entries) < len(rows):
+        truncation_note = (
+            f"\n\n(showing {len(entries)} of {len(rows)}"
+            " — top rows fit Discord's message length)"
         )
-    return header + "\n" + body + footer
+
+    return header + "\n" + body + truncation_note + footer
 
 
 # ---------------------------------------------------------------------------
@@ -340,17 +372,12 @@ def register_commands(
     ) -> None:
         board_val = board.value if board is not None else "top_revealed"
         window_val = window.value if window is not None else "all_time"
+        ephemeral = not public
 
-        # Rate-limit gate first — even cheap queries should respect the
-        # 1/min user cooldown so noisy users don't degrade everyone.
-        remaining = _check_and_set_rate_limit(interaction.user.id)
-        if remaining is not None:
-            await interaction.response.send_message(
-                f"rate limited — try again in {remaining}s.",
-                ephemeral=True,
-            )
-            return
-
+        # VR2-L3: guild-gate FIRST so accidental DM or unconfigured-guild
+        # invocations don't burn the 60s rate-limit slot. Rate-limit is
+        # for "user is spamming the leaderboard" pressure, not "user
+        # mistyped where to invoke".
         guild_id = str(interaction.guild_id) if interaction.guild_id else None
         if guild_id is None:
             await interaction.response.send_message(
@@ -365,13 +392,30 @@ def register_commands(
             )
             return
 
+        remaining = _check_and_set_rate_limit(interaction.user.id)
+        if remaining is not None:
+            await interaction.response.send_message(
+                f"rate limited — try again in {remaining}s.",
+                ephemeral=True,
+            )
+            return
+
         # M1: defer before the DB query + user resolves. A cache-cold
         # board does up to 10 sequential fetch_user calls; at ~250 ms
         # per call that's 2.5 s consumed before the response sends, and
         # Discord's interaction-response window is 3 s. Defer first, then
         # do work, then followup.send. Gives 15 minutes of headroom.
-        await interaction.response.defer(ephemeral=(not public))
+        #
+        # VR2-M1: defer ephemeral MUST match the followup ephemeral or
+        # Discord renders a stuck "thinking…" state on the wrong audience.
+        # Single `ephemeral` local feeds both defer + every followup.
+        await interaction.response.defer(ephemeral=ephemeral)
 
+        # VR2-L1: since_iso is second-precision (strftime omits sub-second
+        # fields), so the 30-day window is right-half-open at second
+        # granularity. A reveal that fired EXACTLY 30d ago + 500ms could
+        # be included or excluded depending on the wall-clock second at
+        # query time. Impact bounded to at-most-one row on the boundary.
         since_iso: str | None = None
         if window_val == "30d":
             since = datetime.now(timezone.utc) - timedelta(days=30)
@@ -389,9 +433,15 @@ def register_commands(
                     )
         except Exception as exc:  # noqa: BLE001 — leaderboard read must not crash
             logger.warning("leaderboard fetch failed", exc_info=exc)
+            # VR2-M1: error followup matches the deferred ephemeral state.
+            # A public defer-then-ephemeral-error leaves the "thinking…"
+            # state visible to everyone with no resolution; matching the
+            # ephemeral flag avoids that. Trade-off: public requests that
+            # fail show the error publicly — honest, the operator opted
+            # into public.
             await interaction.followup.send(
                 "couldn't load the leaderboard right now — try again shortly.",
-                ephemeral=True,
+                ephemeral=ephemeral,
             )
             return
 
@@ -445,7 +495,7 @@ def register_commands(
         )
         await interaction.followup.send(
             text_body,
-            ephemeral=(not public),
+            ephemeral=ephemeral,
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
