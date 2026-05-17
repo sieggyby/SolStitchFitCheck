@@ -23,6 +23,7 @@ from sable_roles.features import (
     burn_me,
     delete_monitor,
     fitcheck_streak,
+    leaderboard,
     reveal_pipeline,
     roast,
     scoring_pipeline,
@@ -75,6 +76,12 @@ class SableRolesClient(discord.Client):
         # so the wrap-existing pattern preserves every earlier binding.
         # No-op until per-guild scoring state is 'revealed' (default 'off').
         reveal_pipeline.register(self)
+        # Scored Mode V2 Pass D: /leaderboard slash command. Public
+        # (not mod-gated), ephemeral default, 1/user/min rate-limited.
+        # Returns the empty-board message on any guild with zero
+        # revealed fits — so this command ships INVISIBLE in effect
+        # until reveals start landing in #fitcheck.
+        leaderboard.register_commands(self.tree, client=self)
         # Per-guild instant sync via copy_global_to (SableTracking pattern).
         for guild_id_str in GUILD_TO_ORG:
             guild = discord.Object(id=int(guild_id_str))
