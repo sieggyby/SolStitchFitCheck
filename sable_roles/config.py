@@ -173,6 +173,45 @@ AIRLOCK_ENABLED: bool = (
     os.environ.get("SABLE_ROLES_AIRLOCK_ENABLED", "true").lower() == "true"
 )
 
+# --- Scored Mode V2 (mig 049-051) ---
+
+# Model id for the vision scoring call. Sonnet 4.6 default per design sec 5.1.
+# Override per-guild via discord_scoring_config.model_id; this env value is the
+# fallback if no per-guild override is set.
+SCORING_MODEL: str = os.environ.get("SABLE_ROLES_SCORING_MODEL", "claude-sonnet-4-6")
+
+# Prompt version label. Stamped on every score row so a prompt revision
+# partitions cleanly (rubric_v1 -> rubric_v2 etc.).
+SCORING_PROMPT_VERSION: str = os.environ.get(
+    "SABLE_ROLES_SCORING_PROMPT_VERSION", "rubric_v1"
+)
+
+# Hamming distance threshold below/eq to which two pHashes are considered
+# the same image (collision). imagehash docs treat <= 10 as "very similar";
+# design sec 7.1 uses 8 for the repost/theft detection.
+PHASH_COLLISION_DISTANCE: int = int(
+    os.environ.get("SABLE_ROLES_PHASH_COLLISION_DISTANCE", "8")
+)
+
+# Look-back window in days for pHash collision detection (per design sec 7.1).
+PHASH_COLLISION_WINDOW_DAYS: int = int(
+    os.environ.get("SABLE_ROLES_PHASH_COLLISION_WINDOW_DAYS", "90")
+)
+
+# Retry delay (seconds) for the single retry-then-fail per design sec 5.3.
+SCORING_RETRY_DELAY_SECONDS: float = float(
+    os.environ.get("SABLE_ROLES_SCORING_RETRY_DELAY_SECONDS", "5.0")
+)
+
+# Hard env kill switch for the entire scored-mode pipeline (pHash compute +
+# collision detection + vision scoring + delete monitoring). When False,
+# Pass A + Pass B handlers are no-ops. Per-guild scoring state is the
+# normal control surface; this is the emergency offload.
+SCORED_MODE_ENABLED: bool = (
+    os.environ.get("SABLE_ROLES_SCORED_MODE_ENABLED", "true").lower() == "true"
+)
+
+
 DM_BANK: list[str] = [
     "images do the talking in here — yours got returned to sender. drop a fit or hop into a thread.",
     "woah sailor, that doesn't go there. pop off a fit in that thread or can it, but no text in the main feed.",
