@@ -51,7 +51,7 @@ logger = logging.getLogger("sable_roles.image_hashing")
 _IMAGE_BYTE_CAP = 10 * 1024 * 1024
 
 
-def _coerce_audit_value(v):
+def coerce_audit_value(v):
     """Coerce a column value to JSON-safe form for audit detail dicts.
 
     Specifically guards against the discord_streak_events.posted_at column
@@ -235,9 +235,9 @@ async def maybe_record_phash(
                         "post_id": post_id_str,
                         "user_id": author_id_str,
                         "phash": phash,
-                        "matched_post_id": _coerce_audit_value(cand.get("post_id")),
-                        "matched_user_id": _coerce_audit_value(cand.get("user_id")),
-                        "matched_posted_at": _coerce_audit_value(cand.get("posted_at")),
+                        "matched_post_id": coerce_audit_value(cand.get("post_id")),
+                        "matched_user_id": coerce_audit_value(cand.get("user_id")),
+                        "matched_posted_at": coerce_audit_value(cand.get("posted_at")),
                         "hamming_distance": dist,
                     },
                     source="sable-roles",

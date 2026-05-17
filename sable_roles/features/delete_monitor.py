@@ -34,6 +34,7 @@ from sable_platform.db import (
     discord_streaks,
 )
 from sable_platform.db.audit import log_audit
+from sable_roles.features.image_hashing import coerce_audit_value
 from sable_platform.db.connection import get_db
 
 from sable_roles.config import GUILD_TO_ORG, SCORED_MODE_ENABLED
@@ -140,11 +141,18 @@ async def on_raw_message_delete(
             cfg = discord_scoring_config.get_config(conn, guild_id)
             score = _fetch_score_row(conn, guild_id, post_id)
 
-        # Best-effort age compute. Posted_at is ISO Z; parse + compare to now.
+        # Best-effort age compute. Posted_at is ISO Z string per schema.py,
+        # but Postgres on the VPS has the column as TIMESTAMPTZ (pre-Scored-
+        # Mode drift) so the row comes back as a tz-aware datetime — handle
+        # both shapes so severity classification gets a real age, not 0.
         try:
-            posted_at = datetime.strptime(
-                event["posted_at"], "%Y-%m-%dT%H:%M:%SZ"
-            ).replace(tzinfo=timezone.utc)
+            raw_posted_at = event["posted_at"]
+            if isinstance(raw_posted_at, datetime):
+                posted_at = raw_posted_at if raw_posted_at.tzinfo else raw_posted_at.replace(tzinfo=timezone.utc)
+            else:
+                posted_at = datetime.strptime(
+                    raw_posted_at, "%Y-%m-%dT%H:%M:%SZ"
+                ).replace(tzinfo=timezone.utc)
             age_seconds = (datetime.now(timezone.utc) - posted_at).total_seconds()
         except Exception:  # noqa: BLE001
             age_seconds = 0.0
@@ -192,7 +200,7 @@ async def on_raw_message_delete(
                     "channel_id": str(channel_id),
                     "post_id": post_id,
                     "user_id": str(event.get("user_id")),
-                    "posted_at": event.get("posted_at"),
+                    "posted_at": coerce_audit_value(event.get("posted_at")),
                     "deleted_at": _now_iso_seconds(),
                     "age_seconds": int(age_seconds),
                     "reaction_count_at_delete": reaction_count,
