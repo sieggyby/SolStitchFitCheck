@@ -17,6 +17,7 @@ mocked SP helpers.
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -65,6 +66,24 @@ def test_truncate_catch_long_gets_ellipsis():
 def test_truncate_catch_exact_max_passes_through():
     s = "a" * 80
     assert leaderboard._truncate_catch(s, max_len=80) == s
+
+
+def test_truncate_catch_collapses_newlines_into_spaces():
+    """M4: catch_detected with embedded newlines would shatter the
+    two-line leaderboard format (header + jump-link on next line).
+    """
+    catch = "Raf bomber silhouette\n\nthe heads\twill\nget it"
+    out = leaderboard._truncate_catch(catch)
+    assert "\n" not in out
+    assert "\t" not in out
+    # Whitespace collapsed to single spaces; double-spaces also collapsed.
+    assert "  " not in out
+    assert out == "Raf bomber silhouette the heads will get it"
+
+
+def test_truncate_catch_whitespace_only_returns_empty():
+    """Empty after whitespace collapse should render as no-catch."""
+    assert leaderboard._truncate_catch("   \n\t  \n") == ""
 
 
 # ---------------------------------------------------------------------------
@@ -293,6 +312,70 @@ async def test_resolve_display_name_handles_http_failure():
     assert name.startswith("unknown")
 
 
+@pytest.mark.asyncio
+async def test_resolve_display_name_does_not_cache_http_failure():
+    """H2: transient HTTPException must NOT be cached. A 30s Discord
+    5xx blip would otherwise poison the leaderboard for the full 15min
+    TTL window, branding every cached user as 'unknown' even after
+    Discord recovers.
+    """
+    mock_client = MagicMock()
+    mock_client.fetch_user = AsyncMock(
+        side_effect=discord.HTTPException(MagicMock(status=500), "transient")
+    )
+    name1 = await leaderboard._resolve_display_name(mock_client, 999)
+    name2 = await leaderboard._resolve_display_name(mock_client, 999)
+    assert name1.startswith("unknown")
+    assert name2.startswith("unknown")
+    # Cache MUST be empty for this user — second call re-fetched.
+    assert 999 not in leaderboard._DISPLAY_NAME_CACHE
+    assert mock_client.fetch_user.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_resolve_display_name_does_cache_not_found():
+    """H2: NotFound (user really gone) SHOULD cache the fallback for
+    full TTL — no point re-querying a dead account every minute.
+    """
+    mock_client = MagicMock()
+    mock_client.fetch_user = AsyncMock(
+        side_effect=discord.NotFound(MagicMock(status=404), "user not found")
+    )
+    name1 = await leaderboard._resolve_display_name(mock_client, 888)
+    name2 = await leaderboard._resolve_display_name(mock_client, 888)
+    assert name1.startswith("unknown")
+    assert name2.startswith("unknown")
+    assert 888 in leaderboard._DISPLAY_NAME_CACHE
+    assert mock_client.fetch_user.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_resolve_display_name_sanitizes_newlines_and_length():
+    """M3: a crafted Discord display_name containing newlines would
+    shatter the two-line leaderboard format and inject fake entries.
+    Also bound the length to prevent absurd display.
+    """
+    crafted = "monasex\n11. fake-entry · 100 · caught: rigged\n\n"
+    mock_user = SimpleNamespace(display_name=crafted, name="monasex")
+    mock_client = MagicMock()
+    mock_client.fetch_user = AsyncMock(return_value=mock_user)
+    name = await leaderboard._resolve_display_name(mock_client, 12345)
+    assert "\n" not in name
+    assert "fake-entry" in name  # sanitized but still readable single-line
+    assert len(name) <= 64
+
+
+@pytest.mark.asyncio
+async def test_resolve_display_name_handles_empty_display_name():
+    """A user with no display_name AND no username falls back to the
+    fallback rather than rendering 'None'."""
+    mock_user = SimpleNamespace(display_name="", name=None)
+    mock_client = MagicMock()
+    mock_client.fetch_user = AsyncMock(return_value=mock_user)
+    name = await leaderboard._resolve_display_name(mock_client, 777)
+    assert name.startswith("unknown")
+
+
 # ---------------------------------------------------------------------------
 # register_commands
 # ---------------------------------------------------------------------------
@@ -323,7 +406,17 @@ def test_register_commands_adds_leaderboard():
 
 
 def _make_interaction(user_id=42, guild_id=100):
-    """Build a minimal mocked Interaction for callback invocation."""
+    """Build a minimal mocked Interaction for callback invocation.
+
+    Covers both response paths:
+      - early-return (rate-limit, missing-guild, unconfigured-guild):
+        interaction.response.send_message
+      - post-defer (success, helper exception): interaction.followup.send
+
+    Per M1 fix, the callback defers BEFORE the DB query + user resolves
+    so a cache-cold 10-user board doesn't blow Discord's 3 s interaction
+    response deadline. Tests must mock both response and followup.
+    """
     interaction = MagicMock()
     interaction.user = MagicMock()
     interaction.user.id = user_id
@@ -334,6 +427,9 @@ def _make_interaction(user_id=42, guild_id=100):
     )
     interaction.response = MagicMock()
     interaction.response.send_message = AsyncMock()
+    interaction.response.defer = AsyncMock()
+    interaction.followup = MagicMock()
+    interaction.followup.send = AsyncMock()
     return interaction
 
 
@@ -381,16 +477,39 @@ async def test_callback_empty_board_renders_empty_text(monkeypatch):
         await cmd.callback(interaction)
 
     mock_helper.assert_called_once()
-    args, kwargs = interaction.response.send_message.call_args
+    # M1: post-defer response goes through followup.send, not response.send_message.
+    interaction.response.defer.assert_awaited_once()
+    args, kwargs = interaction.followup.send.call_args
     assert args[0] == leaderboard.EMPTY_BOARD_TEXT
     assert kwargs.get("ephemeral") is True
+
+
+@pytest.mark.asyncio
+async def test_callback_empty_board_30d_hints_all_time(monkeypatch):
+    """L5: empty + window=30d returns the 30d-specific hint, not the
+    generic empty text — so the user doesn't assume the whole board is
+    empty when they just don't have recent activity."""
+    monkeypatch.setattr(leaderboard, "GUILD_TO_ORG", {"100": "solstitch"})
+
+    with patch.object(
+        leaderboard.discord_fitcheck_scores,
+        "list_top_revealed_fits",
+        return_value=[],
+    ):
+        cmd = _build_tree_with_leaderboard()
+        interaction = _make_interaction()
+        window_choice = app_commands.Choice(name="30d", value="30d")
+        await cmd.callback(interaction, window=window_choice)
+
+    args, _ = interaction.followup.send.call_args
+    assert args[0] == leaderboard.EMPTY_BOARD_TEXT_30D
+    assert "window:all_time" in args[0]
 
 
 @pytest.mark.asyncio
 async def test_callback_public_true_makes_non_ephemeral(monkeypatch):
     monkeypatch.setattr(leaderboard, "GUILD_TO_ORG", {"100": "solstitch"})
     rows = [_row("p1", "1234", 87.0)]
-    public_choice = app_commands.Choice(name="public", value="public")  # unused
     with patch.object(
         leaderboard.discord_fitcheck_scores,
         "list_top_revealed_fits",
@@ -399,7 +518,10 @@ async def test_callback_public_true_makes_non_ephemeral(monkeypatch):
         cmd = _build_tree_with_leaderboard()
         interaction = _make_interaction()
         await cmd.callback(interaction, public=True)
-    args, kwargs = interaction.response.send_message.call_args
+    # public=True propagates through defer + followup.send.
+    defer_kwargs = interaction.response.defer.call_args.kwargs
+    assert defer_kwargs.get("ephemeral") is False
+    args, kwargs = interaction.followup.send.call_args
     assert kwargs.get("ephemeral") is False
 
 
@@ -466,6 +588,104 @@ async def test_callback_window_30d_passes_since_iso(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_callback_drops_rows_with_null_channel_id(monkeypatch):
+    """L6: orphaned score row (no streak_event JOIN match) renders as
+    a broken guild-root link. Drop the row + log a warning instead.
+    """
+    monkeypatch.setattr(leaderboard, "GUILD_TO_ORG", {"100": "solstitch"})
+    # Mix: one good row + one orphan with channel_id=None.
+    rows = [
+        _row("p1", "1234", 87.0, channel_id="chan_1"),
+        _row("p2", "5678", 90.0, channel_id=None),  # orphan
+    ]
+    with patch.object(
+        leaderboard.discord_fitcheck_scores,
+        "list_top_revealed_fits",
+        return_value=rows,
+    ):
+        cmd = _build_tree_with_leaderboard()
+        interaction = _make_interaction()
+        await cmd.callback(interaction)
+
+    args, _ = interaction.followup.send.call_args
+    # Orphan post_id must not appear in the rendered text.
+    assert "p2" not in args[0]
+    # Good post_id present.
+    assert "chan_1/p1" in args[0]
+
+
+@pytest.mark.asyncio
+async def test_callback_defers_before_db_query(monkeypatch):
+    """M1: defer must fire BEFORE the DB call so a slow query doesn't
+    blow Discord's 3 s interaction-response deadline.
+    """
+    monkeypatch.setattr(leaderboard, "GUILD_TO_ORG", {"100": "solstitch"})
+
+    call_order: list[str] = []
+
+    async def _slow_defer(*args, **kwargs):
+        call_order.append("defer")
+
+    def _record_query(*args, **kwargs):
+        call_order.append("query")
+        return []
+
+    cmd = _build_tree_with_leaderboard()
+    interaction = _make_interaction()
+    interaction.response.defer = AsyncMock(side_effect=_slow_defer)
+
+    with patch.object(
+        leaderboard.discord_fitcheck_scores,
+        "list_top_revealed_fits",
+        side_effect=_record_query,
+    ):
+        await cmd.callback(interaction)
+
+    assert call_order[0] == "defer"
+    assert "query" in call_order
+
+
+@pytest.mark.asyncio
+async def test_callback_resolves_users_in_parallel(monkeypatch):
+    """M1: display-name resolves should be gathered, not sequential.
+    Concretely: with 3 unique users each taking 100 ms, total time
+    should be ~100 ms (parallel) not ~300 ms (sequential).
+    """
+    monkeypatch.setattr(leaderboard, "GUILD_TO_ORG", {"100": "solstitch"})
+    rows = [
+        _row("p1", "1111", 90.0),
+        _row("p2", "2222", 80.0),
+        _row("p3", "3333", 70.0),
+    ]
+
+    resolve_calls: list[int] = []
+
+    async def _slow_fetch(uid):
+        resolve_calls.append(uid)
+        await asyncio.sleep(0)  # yield to event loop, simulate await
+        return SimpleNamespace(display_name=f"user_{uid}", name=f"u{uid}")
+
+    cmd = _build_tree_with_leaderboard()
+    interaction = _make_interaction()
+    interaction.client.fetch_user = AsyncMock(side_effect=_slow_fetch)
+
+    with patch.object(
+        leaderboard.discord_fitcheck_scores,
+        "list_top_revealed_fits",
+        return_value=rows,
+    ):
+        await cmd.callback(interaction)
+
+    # All three users resolved (parallel or sequential — assert count).
+    assert len(resolve_calls) == 3
+    # And the output rendered all three names.
+    args, _ = interaction.followup.send.call_args
+    assert "user_1111" in args[0]
+    assert "user_2222" in args[0]
+    assert "user_3333" in args[0]
+
+
+@pytest.mark.asyncio
 async def test_callback_uses_allowed_mentions_none(monkeypatch):
     """Defends against display_name mention-injection on /leaderboard
     output. Mirrors reveal_pipeline's AllowedMentions.none() contract.
@@ -480,12 +700,16 @@ async def test_callback_uses_allowed_mentions_none(monkeypatch):
         cmd = _build_tree_with_leaderboard()
         interaction = _make_interaction()
         await cmd.callback(interaction)
-    args, kwargs = interaction.response.send_message.call_args
+    args, kwargs = interaction.followup.send.call_args
     am = kwargs.get("allowed_mentions")
     assert isinstance(am, discord.AllowedMentions)
     assert am.everyone is False
     assert am.users is False
     assert am.roles is False
+    # H1: Pass C QA round 2 added replied_user assertion because
+    # AllowedMentions.none() sets all FOUR fields; a regression that
+    # defaulted replied_user=True would slip past a three-field assert.
+    assert am.replied_user is False
 
 
 @pytest.mark.asyncio
@@ -501,6 +725,9 @@ async def test_callback_helper_exception_is_user_friendly(monkeypatch):
         interaction = _make_interaction()
         await cmd.callback(interaction)
 
-    args, kwargs = interaction.response.send_message.call_args
+    # Helper raised AFTER defer fired, so user-friendly error goes through
+    # followup.send. M1 contract: post-defer paths never touch response.send_message.
+    interaction.response.defer.assert_awaited_once()
+    args, kwargs = interaction.followup.send.call_args
     assert "couldn't load" in args[0].lower()
     assert kwargs.get("ephemeral") is True

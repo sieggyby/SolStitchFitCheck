@@ -29,6 +29,7 @@ a recall mechanism, not the announcement channel.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -57,6 +58,9 @@ _NAME_CACHE_CAP = 256
 
 CATCH_TRUNCATE_LEN = 80
 EMPTY_BOARD_TEXT = "no revealed fits yet — scored mode is still finding its footing."
+EMPTY_BOARD_TEXT_30D = (
+    "no revealed fits in the last 30 days — try `/leaderboard window:all_time`."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -67,12 +71,21 @@ EMPTY_BOARD_TEXT = "no revealed fits yet — scored mode is still finding its fo
 def _truncate_catch(catch: str | None, max_len: int = CATCH_TRUNCATE_LEN) -> str:
     """Truncate the catch rationale to a fixed display length. Returns
     empty string for None (caller decides whether to render the line).
+
+    M4 (Pass D QA round 1): collapse all whitespace including newlines.
+    catch_detected is Sonnet-generated so not directly user-controlled,
+    but Sonnet plausibly emits multi-line or em-dashed content that
+    would shatter the two-line `header\\n    jump_link` leaderboard
+    entry format and offset every subsequent row.
     """
     if not catch:
         return ""
-    if len(catch) <= max_len:
-        return catch
-    return catch[: max_len - 3] + "..."
+    cleaned = " ".join(catch.split()).strip()
+    if not cleaned:
+        return ""
+    if len(cleaned) <= max_len:
+        return cleaned
+    return cleaned[: max_len - 3] + "..."
 
 
 def _build_jump_link(guild_id: str, channel_id: str | None, post_id: str) -> str:
@@ -94,12 +107,19 @@ def _format_entry(
     catch: str | None,
     jump_link: str,
 ) -> str:
-    """Per-row format per design §9.5."""
+    """Per-row format per design §9.5.
+
+    L7 (Pass D QA round 1): clamp percentile to [1, 100] before display
+    to mirror reveal_pipeline._build_reveal_text behavior. Out-of-range
+    percentiles shouldn't happen but the reveal text and the leaderboard
+    should not disagree on the displayed number for the same fit.
+    """
+    pct_int = max(1, min(100, int(round(percentile))))
     truncated = _truncate_catch(catch)
     if truncated:
-        head = f"{rank:>2}. {display_name} · {int(round(percentile))} · caught: {truncated}"
+        head = f"{rank:>2}. {display_name} · {pct_int} · caught: {truncated}"
     else:
-        head = f"{rank:>2}. {display_name} · {int(round(percentile))}"
+        head = f"{rank:>2}. {display_name} · {pct_int}"
     return f"{head}\n    {jump_link}"
 
 
@@ -112,8 +132,15 @@ def _format_leaderboard(
     public: bool,
 ) -> str:
     """Build the full message body. Returns the empty-board text when
-    `rows` is empty. `display_names` is keyed on `user_id` (str)."""
+    `rows` is empty. `display_names` is keyed on `user_id` (str).
+
+    L5 (Pass D QA round 1): when rows is empty AND window is 30d, hint
+    the caller toward `window:all_time` so they don't assume the whole
+    leaderboard is empty when they just don't have recent activity.
+    """
     if not rows:
+        if window == "30d":
+            return EMPTY_BOARD_TEXT_30D
         return EMPTY_BOARD_TEXT
 
     header_label = "top revealed fits" if board == "top_revealed" else "best per user"
@@ -157,8 +184,25 @@ def _format_leaderboard(
 
 
 def _evict_cooldown_if_full() -> None:
-    """Bounded dict — drop oldest entry by insertion order when at cap.
-    Same pattern as reveal_pipeline._PENDING_REVEALS cap eviction.
+    """Bounded dict — drop oldest entry by insertion order when over cap.
+
+    Eviction runs AFTER insert in the caller, so the `>` predicate is
+    correct: dict transiently holds CAP+1 inside one call, then drops
+    back to CAP after eviction. Using `>=` instead would plateau the
+    dict at CAP-1 — every insert past CAP would evict the about-to-be-
+    superseded entry. Same pattern as reveal_pipeline._PENDING_REVEALS.
+
+    L2 from Pass D QA round 1: FIFO-not-LRU. A chatty user who keeps
+    re-inserting is the OLDEST by insertion order (Python dicts preserve
+    insertion order, not access order), making them the wrong eviction
+    target under sustained churn near cap. Accepted — same punt as
+    reveal_pipeline _pending_reveals (Pass C QA L-NEW-1). At V1 scale
+    (single-digit /min invocations across the whole guild) the cap is
+    not approached.
+
+    L3 from Pass D QA round 1: bot-user self-throttle is not reachable
+    — Discord doesn't deliver INTERACTION_CREATE to bot users invoking
+    slash commands, so `interaction.user.id` is always a human.
     """
     if len(_INVOKE_COOLDOWN) > _COOLDOWN_CAP:
         oldest = next(iter(_INVOKE_COOLDOWN))
@@ -181,16 +225,40 @@ def _check_and_set_rate_limit(user_id: int) -> int | None:
 
 
 def _evict_name_cache_if_full() -> None:
+    """Same insertion-order FIFO + post-insert eviction pattern as
+    _evict_cooldown_if_full. See that docstring for L2/L3 rationale.
+    """
     if len(_DISPLAY_NAME_CACHE) > _NAME_CACHE_CAP:
         oldest = next(iter(_DISPLAY_NAME_CACHE))
         del _DISPLAY_NAME_CACHE[oldest]
 
 
+def _sanitize_display_name(raw: str | None, user_id: int) -> str:
+    """Strip control chars + collapse whitespace + bound length so a
+    crafted Discord display_name can't inject newlines (which would
+    shatter the two-line leaderboard format) or render unbounded text.
+    """
+    fallback = f"unknown ({str(user_id)[:8]})"
+    if not raw:
+        return fallback
+    # Collapse all whitespace including newlines into single spaces.
+    cleaned = " ".join(raw.split()).strip()
+    if not cleaned:
+        return fallback
+    # Discord display names are capped at 32; defend against larger.
+    return cleaned[:64]
+
+
 async def _resolve_display_name(client: discord.Client, user_id: int) -> str:
-    """Resolve a Discord user_id to a display_name string. 15min TTL
-    cache. On Discord API failure (NotFound / HTTPException / network),
-    returns a stable fallback so a transient failure doesn't poison the
-    leaderboard rendering.
+    """Resolve a Discord user_id to a display_name string.
+
+    Cache policy (H2 from Pass D QA round 1):
+      - NotFound (user really gone): cache the fallback for full TTL —
+        no point re-querying a dead account every minute.
+      - HTTPException / unexpected: do NOT cache. A transient 5xx during
+        a 30-second Discord blip must not poison the leaderboard for
+        the full 15-minute TTL window.
+      - Success: cache the resolved + sanitized name for full TTL.
     """
     now = datetime.now(timezone.utc)
     cached = _DISPLAY_NAME_CACHE.get(user_id)
@@ -201,20 +269,29 @@ async def _resolve_display_name(client: discord.Client, user_id: int) -> str:
 
     try:
         user = await client.fetch_user(user_id)
-        # display_name is the global Discord display name (or username
-        # fallback). guild-specific nicks live on Member; for cross-
-        # leaderboard consistency the global name is the right call.
-        name = user.display_name or user.name or f"unknown ({str(user_id)[:8]})"
-    except (discord.NotFound, discord.HTTPException) as exc:
-        logger.info("display_name resolve failed for %s: %s", user_id, exc)
+        raw = user.display_name or user.name
+        name = _sanitize_display_name(raw, user_id)
+        # Persist success — full TTL.
+        _DISPLAY_NAME_CACHE[user_id] = (name, now)
+        _evict_name_cache_if_full()
+        return name
+    except discord.NotFound as exc:
+        # User truly doesn't exist; cache the fallback so we don't burn
+        # a Discord call on the next /leaderboard hit.
+        logger.info("display_name resolve NotFound for %s: %s", user_id, exc)
         name = f"unknown ({str(user_id)[:8]})"
+        _DISPLAY_NAME_CACHE[user_id] = (name, now)
+        _evict_name_cache_if_full()
+        return name
+    except discord.HTTPException as exc:
+        # Transient — DO NOT cache. Next /leaderboard call will re-try
+        # and pick up the real name as soon as Discord recovers.
+        logger.warning("display_name resolve transient HTTPException for %s: %s", user_id, exc)
+        return f"unknown ({str(user_id)[:8]})"
     except Exception as exc:  # noqa: BLE001 — last-line defense
+        # Unknown failure mode — also treat as transient.
         logger.warning("display_name resolve raised %s for %s", type(exc).__name__, user_id)
-        name = f"unknown ({str(user_id)[:8]})"
-
-    _DISPLAY_NAME_CACHE[user_id] = (name, now)
-    _evict_name_cache_if_full()
-    return name
+        return f"unknown ({str(user_id)[:8]})"
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +365,13 @@ def register_commands(
             )
             return
 
+        # M1: defer before the DB query + user resolves. A cache-cold
+        # board does up to 10 sequential fetch_user calls; at ~250 ms
+        # per call that's 2.5 s consumed before the response sends, and
+        # Discord's interaction-response window is 3 s. Defer first, then
+        # do work, then followup.send. Gives 15 minutes of headroom.
+        await interaction.response.defer(ephemeral=(not public))
+
         since_iso: str | None = None
         if window_val == "30d":
             since = datetime.now(timezone.utc) - timedelta(days=30)
@@ -305,36 +389,61 @@ def register_commands(
                     )
         except Exception as exc:  # noqa: BLE001 — leaderboard read must not crash
             logger.warning("leaderboard fetch failed", exc_info=exc)
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "couldn't load the leaderboard right now — try again shortly.",
                 ephemeral=True,
             )
             return
 
-        # Resolve display names (with cache). Sequential fetches are
-        # acceptable at limit=10 + 15min cache.
-        display_names: dict[str, str] = {}
+        # L6: drop rows where channel_id is NULL (LEFT JOIN miss against
+        # discord_streak_events). Jump-link would otherwise drop the
+        # user at the guild root with no channel context — confusing UX.
+        # In practice this shouldn't happen (every scored fit was a
+        # counted streak event); the drop is defensive.
+        filtered_rows = []
         for row in rows:
-            uid = str(row["user_id"])
-            if uid in display_names:
+            if row.get("channel_id") is None:
+                logger.warning(
+                    "leaderboard row missing channel_id (orphan score?) post=%s",
+                    row.get("post_id"),
+                )
                 continue
+            filtered_rows.append(row)
+
+        # M1: parallelize display-name resolves with asyncio.gather. 10
+        # sequential awaits become 1×max-latency instead of 10×avg.
+        # _resolve_display_name uses a 15min cache so repeat hits within
+        # a leaderboard burst are free.
+        unique_uids: list[str] = []
+        seen: set[str] = set()
+        for row in filtered_rows:
+            uid = str(row["user_id"])
+            if uid not in seen:
+                seen.add(uid)
+                unique_uids.append(uid)
+
+        async def _resolve_one(uid: str) -> tuple[str, str]:
             try:
                 uid_int = int(uid)
             except (TypeError, ValueError):
-                display_names[uid] = f"unknown ({uid[:8]})"
-                continue
-            display_names[uid] = await _resolve_display_name(
-                interaction.client, uid_int
-            )
+                return uid, f"unknown ({uid[:8]})"
+            name = await _resolve_display_name(interaction.client, uid_int)
+            return uid, name
+
+        resolved = await asyncio.gather(
+            *(_resolve_one(uid) for uid in unique_uids),
+            return_exceptions=False,
+        )
+        display_names: dict[str, str] = dict(resolved)
 
         text_body = _format_leaderboard(
-            rows,
+            filtered_rows,
             display_names,
             board=board_val,
             window=window_val,
             public=public,
         )
-        await interaction.response.send_message(
+        await interaction.followup.send(
             text_body,
             ephemeral=(not public),
             allowed_mentions=discord.AllowedMentions.none(),
