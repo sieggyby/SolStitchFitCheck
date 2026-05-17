@@ -28,10 +28,13 @@ from datetime import datetime, timezone
 
 import discord
 
-from sable_platform.db import discord_fitcheck_scores, discord_scoring_config
+from sable_platform.db import (
+    discord_fitcheck_scores,
+    discord_scoring_config,
+    discord_streaks,
+)
 from sable_platform.db.audit import log_audit
 from sable_platform.db.connection import get_db
-from sqlalchemy import text
 
 from sable_roles.config import GUILD_TO_ORG, SCORED_MODE_ENABLED
 
@@ -103,29 +106,6 @@ def _now_iso_seconds() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _fetch_streak_event(conn, guild_id: str, post_id: str) -> dict | None:
-    """Fetch the streak event row to recover state-at-time-of-delete.
-
-    Bypasses discord_streaks.get_event so we can keep this module's
-    SP-helper imports minimal — only fitcheck_scores + scoring_config +
-    audit are touched at module-level. The row may be None if the post
-    was deleted before the streak upsert (text-only or no image).
-    """
-    row = conn.execute(
-        text(
-            "SELECT user_id, channel_id, posted_at, reaction_score, image_phash"
-            " FROM discord_streak_events"
-            " WHERE guild_id = :guild_id AND post_id = :post_id LIMIT 1"
-        ),
-        {"guild_id": guild_id, "post_id": post_id},
-    ).fetchone()
-    if row is None:
-        return None
-    if hasattr(row, "_mapping"):
-        return dict(row._mapping)
-    return dict(row)
-
-
 def _fetch_score_row(conn, guild_id: str, post_id: str) -> dict | None:
     return discord_fitcheck_scores.get_score(conn, guild_id, post_id)
 
@@ -154,7 +134,7 @@ async def on_raw_message_delete(
             return
         post_id = str(payload.message_id)
         with get_db() as conn:
-            event = _fetch_streak_event(conn, guild_id, post_id)
+            event = discord_streaks.get_event(conn, guild_id, post_id)
             if event is None:
                 return  # post never qualified for the streak — nothing to flag
             cfg = discord_scoring_config.get_config(conn, guild_id)
@@ -252,7 +232,7 @@ async def on_raw_message_edit(
             return
         post_id = str(payload.message_id)
         with get_db() as conn:
-            event = _fetch_streak_event(conn, guild_id, post_id)
+            event = discord_streaks.get_event(conn, guild_id, post_id)
             if event is None:
                 return
 
@@ -290,11 +270,13 @@ async def on_raw_message_edit(
 def register(client: discord.Client) -> None:
     """Wire the two raw listeners + import-time channel snapshot.
 
-    Composes-with-existing-handlers per the repo convention: this module
-    binds its own coroutines via `client.event(...)`, NOT decorators on
-    `Client.on_raw_message_delete` (which would be replaced rather than
-    composed). Other features that need to bind the same events do the
-    same — discord.py dispatches to ALL registered coroutines.
+    REPLACE-semantics — `client.event(...)` is a set-attribute under the
+    hood. This module is currently the ONLY listener for both
+    `on_raw_message_delete` and `on_raw_message_edit` across the whole
+    sable-roles codebase; binding here is safe. If a future feature
+    needs either event, it MUST switch to the compose-existing-handler
+    pattern (see `roast.py:register` for the precedent) — until then,
+    keep the contract: no other module binds these two events.
     """
     global _client, _FITCHECK_CHANNEL_IDS, _CHANNEL_TO_GUILD
     _client = client

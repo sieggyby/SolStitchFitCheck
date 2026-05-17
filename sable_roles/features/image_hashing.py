@@ -11,8 +11,11 @@ Surface:
   computes pHash, stamps it on the streak event row, then runs collision
   detection in the 90-day window. Emits one of:
     - `fitcheck_image_phash_recorded` (always on success)
-    - `fitcheck_repost_detected` (same user, LOW severity)
+    - `fitcheck_image_phash_failed`   (INFO; PIL decode or read error)
+    - `fitcheck_repost_detected`      (same user, LOW severity)
     - `fitcheck_image_theft_detected` (different user, HIGH severity)
+  (`fitcheck_image_phash_failed` is the implementation-emitted action;
+  design §6.4 catalog should pick it up in the next plan revision.)
 * `compute_phash_from_bytes` — synchronous helper, exposed for tests and
   for the scoring pipeline to reuse (single attachment download per fit).
 
@@ -63,10 +66,12 @@ def hamming_distance(a_hex: str, b_hex: str) -> int:
 
     Both must be the same length; mismatched lengths raise ValueError.
     Uses imagehash.hex_to_hash so we hit the library-validated path.
+    Coerces to Python int — imagehash returns numpy.int64, which fails
+    `isinstance(x, int)` checks in downstream code and audit serialisation.
     """
     a = imagehash.hex_to_hash(a_hex)
     b = imagehash.hex_to_hash(b_hex)
-    return a - b
+    return int(a - b)
 
 
 def _first_image_attachment(
