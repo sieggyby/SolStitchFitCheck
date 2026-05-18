@@ -100,6 +100,14 @@ _client: discord.Client | None = None
 # Reset via `.clear()` in the test conftest fixture (AGENTS.md convention).
 _sweep_done: dict[str, bool] = {}
 
+# R3-L1: track the in-flight sweep task so `close()` can drain it cleanly
+# rather than letting event-loop teardown cancel it mid-flight. A Ctrl-C
+# during boot (after on_ready landed but before sweep completed) would
+# otherwise lose a partial-sweep audit row. The task is fire-and-forget
+# from the on_ready wrapper; close() cancels + gathers like the other
+# feature drains.
+_sweep_task: asyncio.Task | None = None
+
 
 # ---------------------------------------------------------------------------
 # Pure helpers
@@ -861,27 +869,54 @@ def register(client: discord.Client) -> None:
 
     @client.event
     async def on_ready():
+        global _sweep_task
         if existing_on_ready is not None:
             await existing_on_ready()
-        try:
-            # `sweep_orphan_pins` is idempotent via its internal
-            # `_sweep_done` guard (R2-M2), so the on_ready reconnect-
-            # safety contract is satisfied even though we re-enter here
-            # on every reconnect.
-            await sweep_orphan_pins(client)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("state_pin sweep raised: %s", exc, exc_info=True)
+        # R3-L1: launch sweep as a tracked task so close() can drain it.
+        # `sweep_orphan_pins` is idempotent via its internal `_sweep_done`
+        # guard (R2-M2), so re-entry on reconnect is a no-op even though
+        # we'd re-create the task here. Don't re-create if a prior task
+        # is still in-flight — discord reconnect can fire on_ready before
+        # the first sweep returns on cold-cache fetches.
+        if _sweep_task is not None and not _sweep_task.done():
+            return
+        _sweep_task = asyncio.create_task(_run_sweep(client))
+
+
+async def _run_sweep(client: discord.Client) -> None:
+    """Tracked-task wrapper around :func:`sweep_orphan_pins` for the
+    R3-L1 close-drain. Mirrors the recompute-body shape from
+    fitcheck_streak / reveal_pipeline: re-raises CancelledError so the
+    drain's `asyncio.gather(..., return_exceptions=True)` sees clean
+    unwind; catches every other Exception as last-line defense.
+    """
+    try:
+        await sweep_orphan_pins(client)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("state_pin sweep raised: %s", exc, exc_info=True)
 
 
 async def close() -> None:
-    """Cancel + drain in-flight announce tasks. Called from
-    ``SableRolesClient.close()`` BEFORE ``super().close()`` tears down
-    the websocket. Mirrors :func:`fitcheck_streak.close` +
-    :func:`reveal_pipeline.close` precedents.
+    """Cancel + drain in-flight announce tasks AND the boot-time sweep
+    task. Called from ``SableRolesClient.close()`` BEFORE
+    ``super().close()`` tears down the websocket. Mirrors
+    :func:`fitcheck_streak.close` + :func:`reveal_pipeline.close`
+    precedents.
+
+    R3-L1: the sweep task is tracked separately because it's launched
+    from on_ready (not the announce path) but otherwise follows the
+    same cancel-then-gather discipline so a Ctrl-C during boot doesn't
+    leave a partial-sweep audit row unwritten.
     """
+    global _sweep_task
     tasks = list(_pending_announcements.values())
+    if _sweep_task is not None and not _sweep_task.done():
+        tasks.append(_sweep_task)
     for t in tasks:
         t.cancel()
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
     _pending_announcements.clear()
+    _sweep_task = None

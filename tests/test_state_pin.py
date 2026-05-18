@@ -700,6 +700,41 @@ async def test_per_channel_lock_serializes_cross_characteristic_ops(sp_module):
 # ---------------------------------------------------------------------------
 
 
+async def test_close_drains_mid_flight_sweep_task(sp_module):
+    """R3-L1: close() cancels + gathers the boot-time sweep task so a
+    Ctrl-C during boot doesn't leak a partial-sweep audit row past
+    event-loop teardown."""
+    client = _make_client()
+    channel = _make_channel(pinned_messages=[])
+    client._channels[300] = channel
+
+    # Stall the sweep mid-flight by making channel.pins() block on an
+    # event we control.
+    sweep_started = asyncio.Event()
+    sweep_release = asyncio.Event()
+
+    async def slow_pins():
+        sweep_started.set()
+        await sweep_release.wait()
+        return []
+
+    channel.pins = AsyncMock(side_effect=slow_pins)
+
+    # Mirror the on_ready wrapper: launch the tracked task.
+    sp_module._sweep_task = asyncio.create_task(
+        sp_module._run_sweep(client)
+    )
+    await sweep_started.wait()
+    assert sp_module._sweep_task is not None
+    assert not sp_module._sweep_task.done()
+
+    # close() should cancel + drain the sweep without re-raising.
+    await sp_module.close()
+    assert sp_module._sweep_task is None
+    # Release the stub so any straggler can settle.
+    sweep_release.set()
+
+
 async def test_close_drains_pending_and_clears_dict(sp_module):
     """close() cancels every pending task, awaits drain, clears the
     dict. CancelledError re-raise discipline keeps gather clean."""

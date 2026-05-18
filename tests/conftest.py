@@ -164,10 +164,16 @@ def state_pin_module():
     mod._pending_announcements.clear()
     mod._channel_locks.clear()
     mod._sweep_done.clear()
+    # R3-L1: _sweep_task is a module-level scalar tracked for close()
+    # drain. Reset via direct assignment (it's a scalar, not a dict —
+    # the .clear()-not-rebind rule applies to dicts that other modules
+    # hold by reference; no module holds _sweep_task by reference).
+    mod._sweep_task = None
     yield
     mod._pending_announcements.clear()
     mod._channel_locks.clear()
     mod._sweep_done.clear()
+    mod._sweep_task = None
 
 
 def fetch_audit_rows(conn: Connection) -> list[dict]:
