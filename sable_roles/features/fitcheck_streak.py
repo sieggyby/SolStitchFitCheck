@@ -203,6 +203,33 @@ async def on_message(message: discord.Message) -> None:
                 org_id=org_id,
             )
         )
+
+        # Scored Mode V2 Pass A: pHash + collision detection. Fires regardless
+        # of scoring state — pHash + repost/theft signals are valuable even
+        # when scoring is Off. Inline import to keep ordering resilient
+        # against future feature reshuffling.
+        from sable_roles.features import image_hashing as _ih
+        asyncio.create_task(
+            _ih.maybe_record_phash(
+                message=message,
+                org_id=org_id,
+                guild_id=guild_id,
+                client=_client,
+            )
+        )
+
+        # Scored Mode V2 Pass B: vision scoring. NO-OP when per-guild
+        # scoring state is 'off' (the default). Read happens first inside
+        # maybe_score_fit — no API call when off.
+        from sable_roles.features import scoring_pipeline as _sp
+        asyncio.create_task(
+            _sp.maybe_score_fit(
+                message=message,
+                org_id=org_id,
+                guild_id=guild_id,
+                client=_client,
+            )
+        )
         return
 
     # text branch

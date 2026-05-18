@@ -10,6 +10,9 @@ requires-python = ">=3.11"
 dependencies = [
     "discord.py>=2.7",
     "python-dotenv",
+    "anthropic>=0.40",
+    "imagehash>=4.3",
+    "Pillow>=10.0",
     "pytest",
     "pytest-asyncio",
 ]

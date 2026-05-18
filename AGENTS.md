@@ -14,14 +14,16 @@ The one dependency that genuinely matters for understanding the code is **SableP
 
 ## What this is
 
-A dedicated Discord bot for **Sable's community-role automation across client servers**. V1 ships fit-check streak tracking + image-only enforcement for SolStitch's `#fitcheck`. Future features (e.g. `@influenza` monthly rotation, role-tier grants tied to points) plug into the same bot process.
+A dedicated Discord bot for **Sable's community-role automation across client servers**. V1 ships fit-check streak tracking + image-only enforcement for SolStitch's `#fitcheck`. V2 adds the burn-me + roast + vibe + airlock + scored-mode stack. Future features (e.g. `@influenza` monthly rotation, role-tier grants tied to points) plug into the same bot process.
 
 **Repo root:** `~/Projects/sable-roles/`
-**Status:** V1 live in SolStitch since 2026-05-13. Bot running locally on Sieggy's machine; VPS deploy targeted within 24-48h of go-live.
+**Status:** V1 live in SolStitch since 2026-05-13; V2 burn-me + roast + vibe + airlock shipped on Hetzner VPS 2026-05-16 (per `project_stitzy_vps_deployed`). Scored Mode V2 (Pass A+B+C) lives on branch `scored-mode-pass-ab`, default `state='off'` so the deploy ships invisible until a mod flips per-guild.
 
 **Build plan (source of truth):** `~/Projects/SolStitch/internal/fitcheck_v1_build_plan.md`
 **Chunked build TODO + audit history:** `~/Projects/SolStitch/internal/fitcheck_build_TODO.md` (C1-C9 all `[x]`)
 **Ship runbook (live-ops):** `~/Projects/SolStitch/internal/ship_dms.md`
+**Scored Mode V2 plan:** `~/Projects/SolStitch/internal/fitcheck_scored_mode_plan.md` (design locked 2026-05-16; canonical for Pass A+B+C+D)
+**Scored Mode QA log:** `~/Projects/SolStitch/internal/scored_mode_pass_ab_qa_log.md` (2 rounds approved per pass)
 
 ---
 
@@ -61,8 +63,24 @@ SablePlatform integration (NOT in this repo — owned by SP):
         update_reaction_score       UPDATE ... WHERE updated_at = :expected  (optimistic lock)
         get_event                   SELECT * by (guild_id, post_id)
         compute_streak_state        SELECT DISTINCT counted_for_day → app-side iteration
+        set_phash_on_streak_event   once-set immutable image_phash (Scored Mode Pass A)
+        list_recent_phashes_for_collision  90d window for collision detection
+    sable_platform.db.discord_fitcheck_scores   (Scored Mode Pass B+C)
+        upsert_score_success / record_score_failure / get_score
+        count_pool_size / fetch_curve_pool_raw_totals
+        mark_reveal_fired           one-and-done CAS, 'pending' placeholder for reveal_post_id
+        update_reveal_post_id       guarded swap 'pending' → real reply message id
+        mark_reveal_publish_failed  guarded 'pending' → 'publish_failed' (HIGH audit)
+        convert_pending_to_cancelled_deleted  guarded 'pending' → 'cancelled_deleted' (HIGH audit)
+        mark_reveal_cancelled_deleted        delete-handler CAS path
+        record_emoji_milestone_crossing      INSERT ... ON CONFLICT DO NOTHING per (post, emoji, milestone)
+        invalidate_score
+    sable_platform.db.discord_scoring_config   (Scored Mode Pass B)
+        get_config (defaults state='off')
+        set_state  validates off|silent|revealed; audit inside
+        count_status_breakdown
     sable_platform.db.audit.log_audit  (source="sable-roles", actor="discord:bot:<bot_user_id>")
-    Migration 043 + Alembic revision b2da0d6b1be1
+    Migrations 043 (streaks) + 045–048 (V2 stack) + 049–052 (Scored Mode V2 Pass A+B+C)
 ```
 
 Multi-client: one bot process serves all client servers. `GUILD_TO_ORG` (from `SABLE_ROLES_GUILD_TO_ORG_JSON` env var) maps guild_id → SablePlatform `org_id`. `FITCHECK_CHANNELS` (from `SABLE_ROLES_FITCHECK_CHANNELS_JSON`) maps guild_id → {org_id, channel_id}. Same shape conventions as SableTracking's `DISCORD_GUILD_TO_CLIENT`.
@@ -126,6 +144,34 @@ Bot deletes any text-only post, including from `@Atelier` (admins). Discord role
 
 ---
 
+### Scored Mode V2 (Pass A+B+C; branch `scored-mode-pass-ab`, default `state='off'`)
+
+**Default state `'off'` is triple-guarded.** SQL `DEFAULT 'off'` on `discord_scoring_config.state` (migration 051), `get_config` returns `state='off'` when no row exists, and `scoring_pipeline.maybe_score_fit` short-circuits BEFORE any Anthropic call when state is `'off'`. Tests assert each layer (`tests/db/test_discord_scoring_config.py` + `test_scoring_pipeline.py::test_state_off_blocks_all_scoring_no_api_no_db_write`). NO file in either repo flips state to `silent` or `revealed` at init time — operator must `/scoring set` explicitly.
+
+**3-state machine: off / silent / revealed (per-guild).** State lives in `discord_scoring_config`. Pass A (image phash + delete monitor) runs regardless of state; Pass B (vision pipeline + scoring) only fires when state ≠ `off`; Pass C reveal-fire only fires when state == `revealed` AND `posted_at >= state_changed_at` (silent-period posts never reveal even after a Silent → Revealed flip — design §8.3 strict reading; implemented via the post-time gate in `reveal_pipeline._recompute_after_delay` step 9).
+
+**Pass A is always-on defensive infra.** `image_hashing.compute_phash_and_check_collisions` runs on every counted fit regardless of scoring state. pHash stored on `discord_streak_events.image_phash` (Pass A migration 049). Collision detection emits `fitcheck_repost_detected` (LOW, same user) or `fitcheck_image_theft_detected` (HIGH, different user). 90-day window, Hamming distance ≤ 8. `delete_monitor` REPLACE-binds `on_raw_message_delete` + `on_raw_message_edit` — the docstring is honest about REPLACE semantics, future delete/edit binders MUST compose via the `roast.py:register` pattern.
+
+**Prompt-injection defense in scoring pipeline.** Round-1 QA caught user-controlled `display_name` flowing into the Sonnet payload (`scoring_pipeline.py` pre-fix lines 397-401). Fix dropped the `poster:` line entirely; `context_text` now only carries operator-controlled `posted_at` + the JSON schema reminder. Re-introducing display_name (or any user-controlled field) into the API payload is a regression — the inline threat-model comment block in `scoring_pipeline.py` is the durable warning.
+
+**`/scoring set` requires a confirmation view.** `_ScoringSetConfirmView` (`scoring_pipeline.py`) — Discord `ui.View` with danger-style Confirm + neutral Cancel, author-locked via `interaction_check`, buttons disable + `self.stop()` on click, 60s timeout (`on_timeout` disables buttons defensively), same-state no-op short-circuits BEFORE view construction. The Confirm callback wraps `set_state` in try/except for graceful "DB error — try again" on failure. Single typo cost was deemed too high for any one-shot path.
+
+**Reveal pipeline composes; it does not REPLACE.** `reveal_pipeline.register(client)` wraps existing `on_raw_reaction_add` / `on_raw_reaction_remove` / `on_message` / `on_raw_message_delete` handlers via the `roast.py:register` compose-existing-handler pattern. Registered LAST in `main.py.setup_hook` (after `fitcheck_streak`, `burn_me`, `roast`, `vibe_observer`, `airlock`, `delete_monitor`, `scoring_pipeline`). Holds the reverse-lookup tables BY REFERENCE (`fs._FITCHECK_CHANNEL_IDS`), not by snapshot — runtime channel-config changes propagate without re-register.
+
+**5-second debounce + CAS-locked reveal-fire.** `reveal_pipeline._recompute_after_delay` mirrors V1 fitcheck_streak's debounce pattern (self-identity-guarded pop, `CancelledError` re-raise, `close()` drain). Per-post task dict capped at 1024 entries with oldest-insertion eviction. On trigger + state == `'revealed'` + post-time gate: re-read live `discord_scoring_config` (defends against mid-recompute mod flip), CAS-lock via `mark_reveal_fired` with placeholder `reveal_post_id='pending'`, publish reply via `message.reply(..., allowed_mentions=AllowedMentions.none())` (defends against display_name mention-injection), then EITHER `update_reveal_post_id` (success) OR `convert_pending_to_cancelled_deleted` (404 mid-publish → HIGH `fitcheck_reveal_cancelled_deleted` audit with `via:publish_404`) OR `mark_reveal_publish_failed` (5xx → HIGH `fitcheck_reveal_publish_failed` audit). The 404-during-publish branch preserves a gaming-vector signal that a CAS-first design would have silently dropped.
+
+**Per-emoji unique-reactor counting.** Reveal trigger is ≥10 unique reactors on a SINGLE emoji (not aggregated across emojis), per design §3. Bot reactions + OP self-reactions excluded. Per-(post_id, emoji, milestone) crossing state is durable via `discord_fitcheck_emoji_milestones` (Pass C migration 052) — restarts don't re-fire milestone audits. Low-age reactor (<30d Discord account) dedup is in-memory only (M1 punt — accepted at V1 scale, documented).
+
+**Tone band is audit-only.** Reveal reply text uses display_name with NO @-ping. Tone band (`high` ≥80 / `mid` 40-79 / `low` <40) shifts warmth, not voice. The `caught:` line is included ONLY when `catch_detected` is non-null. The other 3 axis rationales live in `axis_rationales_json` on the score row but are NOT surfaced in the reveal — mods pull them from audit if needed.
+
+**Leaderboard query contract (Pass D — future).** The `reveal_fired_at` column is the one-and-done lock for FOUR distinct trigger states: `reactions` and `thread_messages` (real reveals) plus `cancelled_deleted` and `publish_failed` (terminal failure locks). Pass D leaderboard queries MUST filter `reveal_trigger IN ('reactions','thread_messages')` to exclude failure-lock rows. Contract spelled out in `discord_fitcheck_scores.py` module docstring + plan §6.4 + §9.2.
+
+**Prompt caching is mandatory.** `scoring_pipeline` uses Anthropic's `cache_control: ephemeral` on the rubric system block. Per the `claude-api` memory: any Claude SDK call must use prompt caching. Tests assert `cache_control` is set on the system payload (`test_scoring_pipeline.py::test_anthropic_call_uses_cache_control_on_system_block`).
+
+**Audit log retention = forever.** Design §7.5. All `fitcheck_*` actions land in `audit_log` with structured `detail` dict + `actor="discord:bot:<bot_user_id>"`. Reaction logging is NOT per-event — only on milestones (5/8/10) and on suspicious additions (`fitcheck_low_age_reactor`). Keeps table size bounded.
+
+---
+
 ## Working conventions
 
 - **Small patches over rewrites.** Don't refactor `fitcheck_streak.py` cosmetically — it was audited byte-for-byte against the build plan across 5 chunks.
@@ -135,8 +181,9 @@ Bot deletes any text-only post, including from `@Atelier` (admins). Discord role
 - **Don't change `_format_streak` output without updating the SableWeb / future-API consumer expectations** — the angle-bracket embed suppression on the best-fit URL is load-bearing.
 - **DB writes go through SablePlatform helpers, not raw SQL.** `discord_streaks.upsert_streak_event` / `update_reaction_score` / `get_event` / `compute_streak_state` are the only surface. Match the SableTracking pattern of strict layering.
 - **Audit-log every enforcement action.** `actor="discord:bot:<bot_user_id>"`, `source="sable-roles"`, `org_id=<resolved>`, `entity_id=None`, structured `detail` dict.
-- **Run both test suites** before declaring any change green: `cd ~/Projects/sable-roles && .venv/bin/pytest tests/` AND `cd ~/Projects/SablePlatform && .venv/bin/pytest tests/db/test_discord_streaks.py tests/db/test_schema.py`. Schema parity tests will catch any `discord_streak_events` `Table()` drift vs migration 043.
-- **No new repo dependencies without justification.** Current deps: `discord.py>=2.7`, `python-dotenv`, SablePlatform (editable), `pytest`, `pytest-asyncio`. Bot-feature work should be doable with just these.
+- **Run both test suites** before declaring any change green: `cd ~/Projects/sable-roles && .venv/bin/pytest tests/` AND `cd ~/Projects/SablePlatform && .venv/bin/pytest tests/db/test_discord_streaks.py tests/db/test_schema.py`. Schema parity tests will catch any `discord_streak_events` `Table()` drift vs migration 043. For Scored Mode V2 changes also include `tests/db/test_discord_fitcheck_scores.py tests/db/test_discord_scoring_config.py tests/db/test_discord_fitcheck_reveal.py tests/db/test_migrations.py` on the SP side and `tests/test_image_hashing.py tests/test_delete_monitor.py tests/test_scoring_pipeline.py tests/test_scoring_state_machine.py tests/test_reveal_pipeline.py` on this side.
+- **Migrations touch six places.** Any new SP migration needs: SQL file, Alembic revision (chained), `connection.py._MIGRATIONS` tuple append, `migrate_pg.py.TABLE_LOAD_ORDER` + `SEQUENCE_TABLES`, `schema.py` `Table(...)` block (bare-imports style — `Table, Column, Integer, Text, func, text` NOT `sa.X`), plus version-literal bumps in `tests/db/test_migrations.py`, `tests/db/test_connection.py`, `tests/cli/test_init.py`, `docs/CLI_REFERENCE.md`. Schema parity tests will fail loudly if any of the six are missed. SQL files: NO `;` inside `--` comments (the runner splits literally — see `feedback_sableplatform_migration_sql` memory).
+- **No new repo dependencies without justification.** Current deps: `discord.py>=2.7`, `python-dotenv`, `anthropic>=0.40`, `imagehash>=4.3`, `Pillow>=10.0`, SablePlatform (editable), `pytest`, `pytest-asyncio`. Bot-feature work should be doable with just these.
 
 ---
 
@@ -150,6 +197,18 @@ Bot deletes any text-only post, including from `@Atelier` (admins). Discord role
 - 76 tests passing (`tests/test_image_detection.py`, `tests/test_dm_bank.py`, `tests/test_dm_cooldown.py`, `tests/test_reaction_recompute.py`, `tests/test_debounce_race.py`, `tests/test_handler_resilience.py`, `tests/test_unconfigured_guild.py`, `tests/test_format_streak.py`). Plus 19 SablePlatform tests at `~/Projects/SablePlatform/tests/db/test_discord_streaks.py`.
 - Live in SolStitch (guild `1501026101730869290`, `#fitcheck` channel `1501073373252292709`) since 2026-05-13.
 
+**Scored Mode V2 (Pass A+B+C — on branch `scored-mode-pass-ab`, default `state='off'`, ships invisible):**
+
+- `features/image_hashing.py` — pHash compute on every counted fit + 90d collision detection. Emits `fitcheck_image_phash_recorded` / `fitcheck_image_phash_failed` (INFO) / `fitcheck_repost_detected` (LOW) / `fitcheck_image_theft_detected` (HIGH). Runs regardless of scoring state.
+- `features/delete_monitor.py` — `on_raw_message_delete` severity classifier (LOW / MEDIUM / CRITICAL per design §7.2) + `on_raw_message_edit` text-edit audit (lengths only, never content). REPLACE binder. Runs regardless of scoring state.
+- `features/scoring_pipeline.py` — Sonnet 4.6 vision call, temp=0, mandatory prompt caching on the rubric system block, structured-JSON output validation, retry-once-then-fail (streak credit preserved). State-gated on `silent`/`revealed`. `/scoring status | set <off|silent|revealed>` slash command with danger-style Confirm/Cancel view, Manage-Guild gated.
+- `features/reveal_pipeline.py` — debounced per-post recompute, per-emoji unique-reactor counts, milestone audits (5/8/10 reactions), low-age reactor audit (<30d account), CAS-locked reveal-fire with tone-banded plain-text reply (no @-ping), 404-during-publish → cancelled_deleted HIGH audit, 5xx → publish_failed HIGH audit. Gated on `state='revealed'` AND `posted_at >= state_changed_at` (silent-period posts never reveal).
+- `prompts/scoring_system.py` — rubric_v1 system prompt (Cohesion · Execution · Concept · Catch axes, Bollin-calibrated).
+- Default state `'off'` triple-guarded (DEFAULT + helper + pipeline gate). Pass A audit/detection rows still land on `off` state — only Pass B (scoring) + Pass C (reveal) bail.
+- Branch state: 4 commits on sable-roles (`b57463b` scaffold → `010c002` tests+QA → `d5295c7` Pass C → `221f8eb` §8.3 strict), 2 commits on SablePlatform (`fb8dc8f` migs 049-051 → `eecbb90` mig 052). PRs sieggyby/SolStitchFitCheck#1 + sieggyby/SablePlatform#1 OPEN.
+- Test suites: sable-roles 512 passed (`+88` scored-mode); SablePlatform 1529 passed / 3 skipped (`+115` scored-mode).
+- NOT yet flipped on any live guild — `/scoring set silent` must be run manually after deploy per design §10 phasing.
+
 ---
 
 ## What's not built yet
@@ -162,7 +221,22 @@ Bot deletes any text-only post, including from `@Atelier` (admins). Discord role
 6. **Health/status surfacing** — V1 logs to stdout only. `#sable-ops` health-ping deliberately removed (plan round-3 audit — bot has no channel overwrite). When deployed: pull stdout from journalctl/compose logs; consider a `/sable-roles-status` slash command or a SablePlatform alert on `discord_streak_events.created_at` staleness.
 7. **Tier-weighted reactions, public leaderboard, freeze policy, thread-reply scoring, squads, streak-tier roles, AI-gen detection** — all deferred to V2 per plan §8.
 
-See `~/Projects/SolStitch/internal/fitcheck_build_TODO.md` for chunk-level minor follow-ups (cosmetic + non-blocking).
+**Scored Mode V2 deferred (post-Pass-C):**
+
+8. **Pass D — `/leaderboard`** — two boards (Top Revealed Fits + Best Per User), revealed-only, ephemeral default with `public:true` opt-in, per-guild, rate-limited 1/user/min. Gated on ≥10 revealed fits + ≥2 weeks in Revealed mode + Brian sign-off (design §10.2 / §10.6). The query contract `reveal_trigger IN ('reactions','thread_messages')` is already documented (see `discord_fitcheck_scores.py` module docstring) so Pass D can lift it directly.
+9. **`/scoring config` mod command** — edit thresholds + model in DB without redeploy. V1 hardcodes plan §6.3 defaults.
+10. **`/scoring suspicious` mod-review surface** — show HIGH/CRITICAL audit rows from last 30d with jump-links. Premature UX until real suspect rows exist.
+11. **Cross-guild image hash collision** — current pHash collision query is scoped to `org_id`. Multi-guild SolStitch needs cross-guild query.
+12. **Web reverse-image-search per fit** — augment pHash with public web search at score time.
+13. **Configurable axis weights via config table** — V1 hardcodes equal weights. Lever is currently re-prompting only.
+14. **Reference-corpus RAG augmentation for Catch axis** — curated Raf/Helmut/Margiela/Issey/anime visual library. Months of work.
+15. **Alt-cluster reaction analysis query** — uses V1-captured reactor account-age data to surface "all 10 reactors joined Discord within the same 2-week window" patterns.
+16. **Auto-invalidate on Nth repost.**
+17. **Cross-guild SolStitch leaderboard** — when SolStitch goes multi-server.
+18. **Durable low-age-reactor dedup** — currently in-memory bounded dict (M1 punt from Pass C QA). Restart re-audits.
+19. **Last-touch LRU on `_pending_reveals`** — currently insertion-order eviction at cap 1024 (L-NEW-1 punt from Pass C QA). Matters only under sustained burst near cap.
+
+See `~/Projects/SolStitch/internal/fitcheck_build_TODO.md` for chunk-level minor follow-ups (cosmetic + non-blocking). See `~/Projects/SolStitch/internal/scored_mode_pass_ab_qa_log.md` for Pass A+B+C QA history + ready-for-deploy checklist.
 
 ---
 
@@ -176,7 +250,17 @@ See `~/Projects/SolStitch/internal/fitcheck_build_TODO.md` for chunk-level minor
 - `SABLE_ROLES_GUILD_TO_ORG_JSON` — JSON: `{"<guild_id>": "<org_id>"}`. Live SolStitch: `{"1501026101730869290":"solstitch"}`.
 - `SABLE_ROLES_HEALTH_CHANNELS_JSON` — JSON: `{"<guild_id>": "<health_channel_id>"}`. Currently `{}` — bot has no overwrite for SolStitch `#sable-ops`, V1 health goes to stdout only.
 
-**Hardcoded (not sensitive):** `DM_BANK`, `DM_COOLDOWN_SECONDS=300`, `CONFIRMATION_EMOJI="🔥"`, `DEBOUNCE_SECONDS=2.0`, `IMAGE_EXT_ALLOWLIST` — all in `sable_roles/config.py`. Change those by editing config and restarting.
+**Scored Mode V2 env vars (Pass A+B+C — all optional with sensible defaults):**
+
+- `ANTHROPIC_API_KEY` — **required** for scoring + burn_me + roast. Same key shared across all Anthropic-calling features. SolStitch-dedicated key planned per design §11.1 but not yet split.
+- `SABLE_ROLES_SCORED_MODE_ENABLED` — hard kill switch (default `true`). Set `false` to disable Pass A pHash, Pass B scoring, AND Pass C reveal-fire entirely without flipping per-guild state.
+- `SABLE_ROLES_SCORING_MODEL` — default `claude-sonnet-4-6`. Future Haiku/Opus branch lives in `_compute_cost_per_million` (currently single Sonnet rate).
+- `SABLE_ROLES_SCORING_PROMPT_VERSION` — default `rubric_v1`. Stored on every score row for partitioning. Bump on rubric revisions.
+- `SABLE_ROLES_PHASH_COLLISION_DISTANCE` — default `8`. Hamming-distance threshold for pHash collision.
+- `SABLE_ROLES_PHASH_COLLISION_WINDOW_DAYS` — default `90`. Lookback window for collision check.
+- `SABLE_ROLES_SCORING_RETRY_DELAY_SECONDS` — default `5.0`. Delay before retry-once on transient Anthropic errors.
+
+**Hardcoded (not sensitive):** `DM_BANK`, `DM_COOLDOWN_SECONDS=300`, `CONFIRMATION_EMOJI="🔥"`, `DEBOUNCE_SECONDS=2.0`, `REVEAL_DEBOUNCE_SECONDS=5.0`, `IMAGE_EXT_ALLOWLIST`, `_PENDING_REVEALS_CAP=1024` — all in `sable_roles/config.py` or feature modules. Change those by editing config and restarting.
 
 **Production deployment:** when VPS-deployed, inject all `SABLE_ROLES_*` vars as systemd unit `Environment=` or compose `environment:`. Long-term: same secrets-manager story as SablePlatform.
 
@@ -186,9 +270,12 @@ See `~/Projects/SolStitch/internal/fitcheck_build_TODO.md` for chunk-level minor
 
 *(Add entries here when a plan is agreed but not yet implemented)*
 
-- **Item 1 — VPS deploy.** Hetzner VPS already hosts SP's Docker stack. Add `sable-roles` to compose; mount `~/.sable/sable.db` (or `SABLE_DATABASE_URL` for Postgres) so the bot writes to the same `discord_streak_events` table prod queries from. No design decisions outstanding — execution only.
+- ~~**Item 1 — VPS deploy.**~~ DONE 2026-05-16 (per `project_stitzy_vps_deployed`). Hetzner host runs the V2 stack via docker compose; SablePlatform Postgres lives on the same host.
 - **Item 2 — `setup_hook` try/except hardening.** Wrap `tree.sync(guild=...)` in `try/except discord.HTTPException` per SableTracking `bot.py:31-34` precedent. One bad guild_id should log + skip, not crash the whole process. Trivially a one-block edit.
 - **Item 3 — Operator allowlist.** Add `SABLE_ROLES_FITCHECK_ALLOWLIST_JSON` env var (shape: `{"<guild_id>": ["<user_id>", ...]}`). On image-less message in fit-check channel, check allowlist first — if member, skip delete+DM but still audit-log `allowlist_skipped` for traceability. ~10 LOC.
+- **Item 4 — Scored Mode V2 Phase 0 → Phase 1 (Off → Silent).** Pass A+B+C shipped on branch `scored-mode-pass-ab`. Gate to flip: merge both PRs, deploy to VPS, smoke test per `scored_mode_pass_ab_qa_log.md` runbook on Sieggy's test guild, then `/scoring set silent` on a live guild. Default deploy = `off`, no behavior change.
+- **Item 5 — Scored Mode V2 Phase 1 → Phase 2 (Silent → Revealed).** Gated on ≥20 scored fits + ≥7d silent data + ≥5 active posters in #fitcheck during silent + Sieggy spot-check ≥10 + vision API failure rate <5% + Brian sign-off on sample reveals. Pure ops decision, no code change required.
+- **Item 6 — Scored Mode V2 Phase 2 → Phase 3 (Pass D leaderboard).** Build + ship Pass D once ≥10 revealed fits exist + ≥2 weeks Revealed mode + Brian sign-off on opening competitive surface. Build plan exists at design §9 + §10.2.
 
 ---
 
@@ -203,6 +290,19 @@ See `~/Projects/SolStitch/internal/fitcheck_build_TODO.md` for chunk-level minor
 - `_format_streak(state, guild_id)` — `/streak` output renderer; both posted-today / no-fit-today + best-fit / none-yet branches
 - `FITCHECK_CHANNELS`, `GUILD_TO_ORG` — env-loaded routing dicts in `config.py`
 - `_FITCHECK_CHANNEL_IDS`, `_CHANNEL_TO_GUILD` — module-level reverse-lookup tables built once at import
+
+**Scored Mode V2:**
+- `image_hashing.compute_phash_and_check_collisions(image_bytes, ctx)` — Pass A entry point; runs regardless of scoring state
+- `delete_monitor.register(client)` — REPLACE binder for `on_raw_message_delete` + `on_raw_message_edit`
+- `scoring_pipeline.maybe_score_fit(message, ctx)` — Pass B entry point; state-gated, no-op when `state='off'`
+- `scoring_pipeline._ScoringSetConfirmView` — danger-style Confirm/Cancel `ui.View` for `/scoring set`
+- `scoring_pipeline.register_commands(tree)` — registers `/scoring` (mod-only, Manage Guild + in-handler defense-in-depth)
+- `reveal_pipeline.register(client)` — composes `on_raw_reaction_add/remove` + `on_message` + `on_raw_message_delete`; registered LAST in `setup_hook`
+- `reveal_pipeline._recompute_after_delay(post_id, channel_id, guild_id, org_id)` — 5s debounce body with self-identity-guarded pop
+- `reveal_pipeline.close()` — drains `_pending_reveals` tasks; called from `SableRolesClient.close()` before `super().close()`
+- `reveal_pipeline.TRIGGER_REACTIONS` / `TRIGGER_THREAD_MESSAGES` / `TRIGGER_PENDING` / `SUCCESS_TRIGGERS` — reveal-trigger string constants (NIT-N3 fix)
+- `reveal_pipeline._build_reveal_text(score_row, display_name)` — pure formatter; tone band by percentile
+- `reveal_pipeline._PENDING_REVEALS_CAP` — module constant (1024) gating eviction in `_pending_reveals` dict
 
 ---
 
@@ -243,9 +343,39 @@ sable_roles/
                                /airlock-status (AIRLOCK_TRIAGE_ROLES tier); /add-team-inviter
                                /list-team-inviters (MOD_ROLES team-only); bootstrap(client) for
                                env-seed team-inviters + invite-snapshot first-fetch on on_ready
+    image_hashing.py         — Scored Mode Pass A: pHash compute + 90d collision detection.
+                               compute_phash_and_check_collisions(image_bytes, ctx) runs from
+                               fitcheck_streak's image branch regardless of scoring state. Emits
+                               fitcheck_image_phash_recorded / _failed (INFO),
+                               fitcheck_repost_detected (LOW, same user),
+                               fitcheck_image_theft_detected (HIGH, different user).
+    delete_monitor.py        — Scored Mode Pass A: on_raw_message_delete severity classifier
+                               (LOW / MEDIUM / CRITICAL per design §7.2) + on_raw_message_edit
+                               text-edit audit (lengths only). REPLACE binder — future binders MUST
+                               compose via roast.py:register pattern (docstring is honest).
+    scoring_pipeline.py      — Scored Mode Pass B: Sonnet 4.6 vision call, temp=0, mandatory
+                               prompt caching on rubric system block, structured-JSON validation,
+                               retry-once-then-fail. State-gated on silent|revealed (no-op on off).
+                               maybe_score_fit(message, ctx) is the entry point.
+                               /scoring status | set <off|silent|revealed> slash command +
+                               _ScoringSetConfirmView (danger Confirm, author-lock, on_timeout +
+                               try/except around set_state per Pass C deferred polish).
+    reveal_pipeline.py       — Scored Mode Pass C: debounced per-post recompute (5s, mirrors V1
+                               fitcheck_streak debounce). on_raw_reaction_add/remove + on_message
+                               (thread filter) + on_raw_message_delete COMPOSE wrappers. Per-emoji
+                               unique-reactor counts (bot + OP filtered). Milestone audits 5/8/10
+                               (durable via discord_fitcheck_emoji_milestones). Low-age reactor
+                               audit (<30d account, in-memory dedup). CAS-locked reveal-fire with
+                               'pending' placeholder, AllowedMentions.none(), 404→cancelled_deleted
+                               HIGH, 5xx→publish_failed HIGH. State='revealed' AND posted_at >=
+                               state_changed_at gate. _PENDING_REVEALS_CAP=1024. close() drain
+                               wired into SableRolesClient.close().
   prompts/
     burn_me_system.py        — locked roast voice + safety rails (B5)
     vibe_infer_system.py     — R11: strict-JSON vibe inference prompt
+    scoring_system.py        — Scored Mode rubric_v1 system prompt (Cohesion · Execution · Concept
+                               · Catch axes, Bollin-calibrated). Cached as the system block on
+                               every Sonnet call.
 tests/
   conftest.py                — fitcheck_module fixture + fetch_audit_rows / fetch_streak_rows
   test_image_detection.py / test_dm_bank.py / test_dm_cooldown.py / test_unconfigured_guild.py
@@ -263,6 +393,18 @@ tests/
   test_vibe_observer.py      — R10 listener + rollup + GC + kill switch
   test_vibe_inference.py     — R11 inference + vibe_block injection
   test_airlock.py            — A3-A6 invite snapshot + member join + mod commands + team-only commands
+  test_image_hashing.py                  — Scored Mode Pass A: pHash compute, Hamming, collision (16)
+  test_delete_monitor.py                 — Scored Mode Pass A: severity matrix + edit audit (13)
+  test_scoring_pipeline.py               — Scored Mode Pass B: state gate, retry, ON CONFLICT,
+                                           cache_control, _ScoringSetConfirmView, on_timeout,
+                                           Confirm-callback DB-error graceful path (17 = 14 + 3)
+  test_scoring_state_machine.py          — Scored Mode Pass B: off↔silent↔revealed transitions (5)
+  test_reveal_pipeline.py                — Scored Mode Pass C: build text, tone band, schedule
+                                           replace, handler gates, recompute paths, one-and-done
+                                           lock, invalidated bail, 404→cancelled_deleted, 5xx→
+                                           publish_failed, AllowedMentions.none, mid-recompute
+                                           state-flip race, milestone dedup, pending-reveals cap,
+                                           register-binds-by-reference, §8.3 strict gate (38 = 35 + 3)
 INVITE_SETUP.md              — Discord developer portal walkthrough + invite URL
 SMOKE_TEST.md                — fitcheck V1 smoke (10 scenarios)
 SMOKE_TEST_ROAST.md          — R12: /roast V1+V2 + personalization smoke (28 scenarios)
@@ -278,7 +420,7 @@ pyproject.toml               — discord.py>=2.7, anthropic, python-dotenv, pyte
 ```
 
 **External:**
-- `~/Projects/SablePlatform/sable_platform/db/discord_streaks.py` — DB helpers + list_active_streak_users (R8)
+- `~/Projects/SablePlatform/sable_platform/db/discord_streaks.py` — DB helpers + list_active_streak_users (R8) + set_phash_on_streak_event + list_recent_phashes_for_collision (Scored Mode Pass A)
 - `~/Projects/SablePlatform/sable_platform/db/discord_burn.py` — opt-in + daily-cap helpers (B5)
 - `~/Projects/SablePlatform/sable_platform/db/discord_guild_config.py` — relax/burn/personalize mode (R3)
 - `~/Projects/SablePlatform/sable_platform/db/discord_roast.py` — R1+R6+R7: blocklist, token economy,
@@ -287,13 +429,28 @@ pyproject.toml               — discord.py>=2.7, anthropic, python-dotenv, pyte
   vibe upsert + validate, purge, list_recent_observation_users
 - `~/Projects/SablePlatform/sable_platform/db/discord_airlock.py` — A1: invite snapshot diff,
   team-inviter allowlist, member admit ledger with airlock state machine
+- `~/Projects/SablePlatform/sable_platform/db/discord_fitcheck_scores.py` — Scored Mode Pass B+C:
+  upsert_score_success / record_score_failure / get_score / count_pool_size /
+  fetch_curve_pool_raw_totals / mark_reveal_fired (CAS) / update_reveal_post_id (guarded swap) /
+  mark_reveal_publish_failed / convert_pending_to_cancelled_deleted / mark_reveal_cancelled_deleted /
+  record_emoji_milestone_crossing / list_emoji_milestone_crossings_for_post / invalidate_score.
+  Module docstring contains the leaderboard query contract (trigger-IN filter).
+- `~/Projects/SablePlatform/sable_platform/db/discord_scoring_config.py` — Scored Mode Pass B:
+  get_config (defaults state='off'), set_state (validates off|silent|revealed; audit inside),
+  count_status_breakdown.
 - `~/Projects/SablePlatform/sable_platform/db/migrations/043_discord_streak_events.sql`
 - `~/Projects/SablePlatform/sable_platform/db/migrations/045_relax_mode_persist.sql`
 - `~/Projects/SablePlatform/sable_platform/db/migrations/046_burn_optins_random_log.sql`
 - `~/Projects/SablePlatform/sable_platform/db/migrations/047_roast_personalization.sql` (R1)
 - `~/Projects/SablePlatform/sable_platform/db/migrations/048_airlock.sql` (A1) — 3 tables for airlock
+- `~/Projects/SablePlatform/sable_platform/db/migrations/049_discord_streak_events_phash.sql` — Scored Mode Pass A: ALTER discord_streak_events ADD COLUMN image_phash + idx_org_phash
+- `~/Projects/SablePlatform/sable_platform/db/migrations/050_discord_fitcheck_scores.sql` — Scored Mode Pass B: per-fit scoring row (success/failed)
+- `~/Projects/SablePlatform/sable_platform/db/migrations/051_discord_scoring_config.sql` — Scored Mode Pass B: per-guild state machine; default state='off'
+- `~/Projects/SablePlatform/sable_platform/db/migrations/052_discord_fitcheck_emoji_milestones.sql` — Scored Mode Pass C: per-(post, emoji, milestone) crossing state for durable dedup
 - `~/Projects/SolStitch/internal/fitcheck_v1_build_plan.md` — fitcheck V1 plan
 - `~/Projects/SolStitch/internal/burn_me_v1_build_plan.md` — burn-me V1 plan
 - `~/Projects/SolStitch/internal/roast_v1_v2_personalization_plan.md` — /roast plan (R0-R13)
 - `~/Projects/SolStitch/internal/roast_build_TODO.md` — /roast audit history
 - `~/Projects/SolStitch/internal/fitcheck_build_TODO.md` — Audit history per chunk + minor follow-ups
+- `~/Projects/SolStitch/internal/fitcheck_scored_mode_plan.md` — Scored Mode V2 canonical design (Pass A+B+C+D)
+- `~/Projects/SolStitch/internal/scored_mode_pass_ab_qa_log.md` — Pass A+B+C adversarial QA history + deploy runbook

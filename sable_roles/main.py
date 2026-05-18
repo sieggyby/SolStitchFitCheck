@@ -18,7 +18,17 @@ from sqlalchemy import text
 from sable_platform.db.connection import get_db
 
 from sable_roles.config import GUILD_TO_ORG, SABLE_ROLES_DISCORD_TOKEN
-from sable_roles.features import airlock, burn_me, fitcheck_streak, roast, vibe_observer
+from sable_roles.features import (
+    airlock,
+    burn_me,
+    delete_monitor,
+    fitcheck_streak,
+    leaderboard,
+    reveal_pipeline,
+    roast,
+    scoring_pipeline,
+    vibe_observer,
+)
 
 logger = logging.getLogger("sable_roles")
 
@@ -54,6 +64,24 @@ class SableRolesClient(discord.Client):
         vibe_observer.start_tasks()    # R10: rollup + GC background loops
         airlock.register(self)  # A3+A4: on_member_join/remove/invite_* (composes)
         airlock.register_commands(self.tree, client=self)  # A5+A6: mod commands
+        # Scored Mode V2 Pass A: on_raw_message_delete + on_raw_message_edit
+        # (composes — discord.py dispatches to all registered handlers).
+        delete_monitor.register(self)
+        # Scored Mode V2 Pass B: /scoring slash command. Default state is
+        # `off` per migration 051 default — no scoring fires until a mod
+        # explicitly runs `/scoring action:set state:silent`.
+        scoring_pipeline.register_commands(self.tree, client=self)
+        # Scored Mode V2 Pass C: reveal pipeline. Composes with all
+        # prior reaction / message / delete handlers — MUST register LAST
+        # so the wrap-existing pattern preserves every earlier binding.
+        # No-op until per-guild scoring state is 'revealed' (default 'off').
+        reveal_pipeline.register(self)
+        # Scored Mode V2 Pass D: /leaderboard slash command. Public
+        # (not mod-gated), ephemeral default, 1/user/min rate-limited.
+        # Returns the empty-board message on any guild with zero
+        # revealed fits — so this command ships INVISIBLE in effect
+        # until reveals start landing in #fitcheck.
+        leaderboard.register_commands(self.tree, client=self)
         # Per-guild instant sync via copy_global_to (SableTracking pattern).
         for guild_id_str in GUILD_TO_ORG:
             guild = discord.Object(id=int(guild_id_str))
@@ -89,6 +117,7 @@ class SableRolesClient(discord.Client):
         # Graceful drain. Client.close() is discord.py 2.x's documented shutdown hook.
         vibe_observer.stop_tasks()
         await fitcheck_streak.close()
+        await reveal_pipeline.close()
         await super().close()
 
 
