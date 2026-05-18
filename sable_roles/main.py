@@ -27,6 +27,7 @@ from sable_roles.features import (
     reveal_pipeline,
     roast,
     scoring_pipeline,
+    state_pin,
     vibe_observer,
 )
 
@@ -82,6 +83,12 @@ class SableRolesClient(discord.Client):
         # revealed fits — so this command ships INVISIBLE in effect
         # until reveals start landing in #fitcheck.
         leaderboard.register_commands(self.tree, client=self)
+        # State-pin surface: slash-command-triggered pinned dashboard
+        # in the per-guild #sable-ops channel. Composes on_ready for a
+        # boot-time orphan-pin sweep; no reaction/message handlers.
+        # Default-invisible: when SABLE_ROLES_OPS_CHANNELS_JSON is empty
+        # for a guild, announce_state_change is a no-op + LOW audit.
+        state_pin.register(self)
         # Per-guild instant sync via copy_global_to (SableTracking pattern).
         for guild_id_str in GUILD_TO_ORG:
             guild = discord.Object(id=int(guild_id_str))
@@ -118,6 +125,7 @@ class SableRolesClient(discord.Client):
         vibe_observer.stop_tasks()
         await fitcheck_streak.close()
         await reveal_pipeline.close()
+        await state_pin.close()
         await super().close()
 
 

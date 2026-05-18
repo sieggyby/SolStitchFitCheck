@@ -146,6 +146,36 @@ def make_message(
     return message
 
 
+@pytest.fixture(autouse=True)
+def state_pin_module():
+    """Reset state_pin module-level dicts per test (AGENTS.md + state-
+    pin plan §3.2 + R1-H4/R1-L5).
+
+    Uses ``.clear()`` not rebinding so other features holding by-reference
+    handles to these dicts (none today, but the convention is load-bearing
+    for future composition) stay in lockstep.
+
+    The fixture is intentionally autouse-stateless: it only resets
+    module-level state. Tests that need to monkeypatch ``OPS_CHANNELS``
+    or stub ``announce_state_change`` opt in via the per-test
+    ``sp_module`` / ``announce_calls`` fixtures.
+    """
+    from sable_roles.features import state_pin as mod
+    mod._pending_announcements.clear()
+    mod._channel_locks.clear()
+    mod._sweep_done.clear()
+    # R3-L1: _sweep_task is a module-level scalar tracked for close()
+    # drain. Reset via direct assignment (it's a scalar, not a dict —
+    # the .clear()-not-rebind rule applies to dicts that other modules
+    # hold by reference; no module holds _sweep_task by reference).
+    mod._sweep_task = None
+    yield
+    mod._pending_announcements.clear()
+    mod._channel_locks.clear()
+    mod._sweep_done.clear()
+    mod._sweep_task = None
+
+
 def fetch_audit_rows(conn: Connection) -> list[dict]:
     rows = conn.execute("SELECT actor, action, org_id, detail_json, source FROM audit_log").fetchall()
     return [dict(r._mapping) if hasattr(r, "_mapping") else dict(r) for r in rows]
