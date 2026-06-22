@@ -92,7 +92,20 @@ def _static_cards(org: str) -> list[dict]:
 def _payload_text(payload_json: str) -> str:
     try:
         p = json.loads(payload_json)
-        return p["text"] if isinstance(p, dict) and isinstance(p.get("text"), str) else payload_json
+        if not isinstance(p, dict):
+            return payload_json
+        if isinstance(p.get("text"), str):
+            return p["text"]
+        # meme producer payload: {template_id, format, captions:{zone:text}, remix_of?} — show the
+        # FORMAT (human name) + caption text, matching SableWeb's deck card (no surface drift).
+        caps_obj = p.get("captions")
+        if isinstance(caps_obj, dict):
+            caps = " / ".join(str(v) for v in caps_obj.values() if isinstance(v, str) and v)
+            fmt = p.get("format") if isinstance(p.get("format"), str) else None
+            fmt = fmt or (p.get("template_id") if isinstance(p.get("template_id"), str) else None)
+            remix = f" · remix of {p['remix_of']}" if isinstance(p.get("remix_of"), str) and p["remix_of"] else ""
+            return f"[{fmt}{remix}] {caps}" if fmt else (caps or payload_json)
+        return payload_json
     except (ValueError, TypeError):
         return payload_json
 
