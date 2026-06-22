@@ -21,6 +21,7 @@ from sable_roles.config import GUILD_TO_ORG, SABLE_ROLES_DISCORD_TOKEN
 from sable_roles.features import (
     airlock,
     burn_me,
+    content_deck,
     delete_monitor,
     fitcheck_streak,
     leaderboard,
@@ -89,11 +90,22 @@ class SableRolesClient(discord.Client):
         # Default-invisible: when SABLE_ROLES_OPS_CHANNELS_JSON is empty
         # for a guild, announce_state_change is a no-op + LOW audit.
         state_pin.register(self)
+        # Content Deck (Phase 0 spike) — registers /content-deck GUILD-SCOPED to TEST
+        # guilds only (SABLE_ROLES_CONTENT_DECK_GUILDS_JSON), refusing any live
+        # GUILD_TO_ORG guild. Returns the safe test-guild ids to sync below. Empty by
+        # default → no registration (invisible). NEVER touches the global tree, so the
+        # copy_global_to loop below can never fan it onto a live client guild.
+        content_deck_guilds = content_deck.register_commands(self.tree, client=self)
         # Per-guild instant sync via copy_global_to (SableTracking pattern).
         for guild_id_str in GUILD_TO_ORG:
             guild = discord.Object(id=int(guild_id_str))
             self.tree.copy_global_to(guild=guild)
             await self.tree.sync(guild=guild)
+        # Sync the guild-scoped /content-deck onto its TEST guilds only (these are NOT in
+        # GUILD_TO_ORG by construction — _safe_test_guilds refuses overlap — so the loop
+        # above did not touch them; sync pushes ONLY the guild-scoped command, no globals).
+        for gid in content_deck_guilds:
+            await self.tree.sync(guild=discord.Object(id=int(gid)))
 
     async def on_ready(self) -> None:
         logger.info(

@@ -46,6 +46,16 @@ MOD_ROLES: dict = json.loads(
     os.environ.get("SABLE_ROLES_MOD_ROLES_JSON", "{}")
 )
 
+# Content Deck (Phase 0 spike) — TEST-ONLY guild→org map for the guild-scoped
+# /content-deck swipe game. Shape: {"<test_guild_id>": "<org_id>"}. Empty (default)
+# → the feature does not register (ships invisible). At registration the feature
+# REFUSES any guild that is also in GUILD_TO_ORG (a live client guild) — /content-deck
+# is test-only and must run on a SEPARATE bot token whose bot is in no live guild.
+# See features/content_deck.py + ~/sable-workspace/CONTENT_DECK_MASTERPLAN.md Phase 0.
+CONTENT_DECK_GUILDS: dict = json.loads(
+    os.environ.get("SABLE_ROLES_CONTENT_DECK_GUILDS_JSON", "{}")
+)
+
 # --- Burn-me feature config (V2) ---
 
 # Anthropic API key for /burn-me LLM calls. The anthropic SDK auto-reads
