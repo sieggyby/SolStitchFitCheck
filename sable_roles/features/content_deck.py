@@ -22,11 +22,13 @@ feature ships invisible.
 """
 from __future__ import annotations
 
+import json
 import logging
 
 import discord
 from discord import app_commands
 
+from sable_platform.db import content_deck as cd_db
 from sable_platform.db.audit import log_audit
 from sable_platform.db.connection import get_db
 
@@ -82,8 +84,40 @@ def _safe_test_guilds() -> dict[str, str]:
     return safe
 
 
-def _seed_for(org: str) -> list[dict]:
-    return _SEED.get(org, _FALLBACK)
+def _static_cards(org: str) -> list[dict]:
+    """The static fallback deck (id=None -> swipes go to the audit_log sink)."""
+    return [{**c, "id": None} for c in _SEED.get(org, _FALLBACK)]
+
+
+def _payload_text(payload_json: str) -> str:
+    try:
+        p = json.loads(payload_json)
+        return p["text"] if isinstance(p, dict) and isinstance(p.get("text"), str) else payload_json
+    except (ValueError, TypeError):
+        return payload_json
+
+
+def _load_cards(org: str, operator_handle: str) -> list[dict]:
+    """The deck for `org`, WIRED to mig 076: durable PENDING content_candidates if any, else
+    the static seed. A durable card carries its int `id` (swipes -> content_deck_decisions);
+    a static card has id=None (swipes -> audit_log). Degrades to static if the table is absent.
+    """
+    try:
+        with get_db() as conn:
+            rows = cd_db.list_deck_candidates(conn, org, operator_handle)
+        if rows:
+            return [
+                {
+                    "id": int(r["id"]),
+                    "ref": str(r["id"]),
+                    "kind": r["kind"],
+                    "text": _payload_text(r["payload_json"]),
+                }
+                for r in rows
+            ]
+    except Exception as exc:  # noqa: BLE001  -- table absent / read error -> static fallback
+        logger.warning("content_deck durable read failed (%s) -- using static seed", exc)
+    return _static_cards(org)
 
 
 def _card_embed(card: dict, *, index: int, total: int, org: str, kept: int) -> discord.Embed:
@@ -149,26 +183,40 @@ class _DeckView(discord.ui.View):
             return
         if decision == "keep":
             self._kept += 1
-        # Audit the swipe (best-effort — a logging failure must not break the deck).
+        # Record the swipe (best-effort -- a write failure must not break the deck). DURABLE
+        # path (a real candidate id) -> content_deck_decisions via the fail-closed accessor
+        # (org-checked); STATIC fallback (id is None) -> the append-only audit_log sink.
         try:
             with get_db() as conn:
-                log_audit(
-                    conn,
-                    actor=f"discord:user:{interaction.user.id}",
-                    action=f"content_deck_{decision}",
-                    org_id=self._org,
-                    entity_id=None,
-                    detail={
-                        "guild_id": self._guild_id,
-                        "candidate_ref": card["ref"],
-                        "kind": card["kind"],
-                        "decision": decision,
-                        "surface": "discord",
-                    },
-                    source="sable-roles",
-                )
+                if card.get("id") is not None:
+                    cd_db.record_deck_decision(
+                        conn,
+                        candidate_id=int(card["id"]),
+                        org_id=self._org,
+                        actor=f"discord:user:{interaction.user.id}",
+                        actor_kind="community",
+                        decision=decision,
+                        surface="discord",
+                    )
+                    conn.commit()
+                else:
+                    log_audit(
+                        conn,
+                        actor=f"discord:user:{interaction.user.id}",
+                        action=f"content_deck_{decision}",
+                        org_id=self._org,
+                        entity_id=None,
+                        detail={
+                            "guild_id": self._guild_id,
+                            "candidate_ref": card["ref"],
+                            "kind": card["kind"],
+                            "decision": decision,
+                            "surface": "discord",
+                        },
+                        source="sable-roles",
+                    )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("content_deck audit write failed: %s", exc)
+            logger.warning("content_deck swipe write failed: %s", exc)
 
         self._index += 1
         nxt = self._current()
@@ -227,7 +275,7 @@ def register_commands(
                 "content deck isn't enabled here.", ephemeral=True, allowed_mentions=_NO_MENTIONS
             )
             return
-        cards = _seed_for(org)
+        cards = _load_cards(org, f"discord:user:{interaction.user.id}")
         if not cards:
             await interaction.response.send_message(
                 "no candidates seeded for this org yet.", ephemeral=True, allowed_mentions=_NO_MENTIONS
