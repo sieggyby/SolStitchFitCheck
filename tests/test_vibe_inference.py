@@ -23,6 +23,10 @@ from sable_roles.features import roast
 from sable_roles.features import vibe_observer
 
 
+
+def _rel(hours_ago: float) -> str:
+    return (datetime.now(timezone.utc) - timedelta(hours=hours_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
 def _make_db_context(db_conn):
     class _Ctx:
         def __enter__(self_inner):
@@ -54,12 +58,12 @@ def _seed_rollup(db_conn, *, user_id="555", guild_id="100", message_count=10):
         "  sample_messages_json, reaction_emojis_given_json,"
         "  channels_active_in_json, computed_at)"
         " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (guild_id, user_id, "2026-05-01T00:00:00Z", "2026-05-15T00:00:00Z",
+        (guild_id, user_id, _rel(24 * 14), _rel(1),
          message_count,
          json.dumps(["bold fit", "muted today"]),
          json.dumps({"🔥": 4, "💀": 1}),
          json.dumps(["200"]),
-         "2026-05-15T12:00:00Z"),
+         _rel(1)),
     )
     db_conn.commit()
 
@@ -266,7 +270,7 @@ async def test_inference_pass_skips_when_personalize_off(
         " (guild_id, channel_id, message_id, user_id, posted_at, captured_at)"
         " VALUES (?, ?, ?, ?, ?, ?)",
         ("100", "200", "m1", "555",
-         "2026-05-15T12:00:00Z", "2026-05-15T12:00:00Z"),
+         _rel(2), _rel(2)),
     )
     db_conn.commit()
     fake_client = MagicMock()
@@ -296,7 +300,7 @@ async def test_inference_pass_runs_when_personalize_on(
         " (guild_id, channel_id, message_id, user_id, posted_at, captured_at)"
         " VALUES (?, ?, ?, ?, ?, ?)",
         ("100", "200", "m1", "555",
-         "2026-05-15T12:00:00Z", "2026-05-15T12:00:00Z"),
+         _rel(2), _rel(2)),
     )
     db_conn.commit()
     fake_client = MagicMock()

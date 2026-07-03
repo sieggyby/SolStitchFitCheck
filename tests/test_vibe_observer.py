@@ -331,10 +331,16 @@ async def test_observe_reaction_kill_switch(
 # ---------------------------------------------------------------------------
 
 
+# RELATIVE recent default (now-1h) so windowed rollup/GC tests never time-rot — the
+# hardcoded 2026-05-15 default fell out of the 30-day observation window mid-June and
+# silently broke six tests (same disease + cure as Slopper's meta-db date fixtures).
+_RECENT = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _seed_observation(
     db_conn, *, user_id: str, message_id: str,
     content: str | None = "msg", reactions: dict | None = None,
-    posted_at: str = "2026-05-15T12:00:00Z",
+    posted_at: str = _RECENT,
     guild_id: str = "100", channel_id: str = "200",
 ):
     db_conn.execute(
