@@ -22,6 +22,7 @@ from sable_roles.features import (
     airlock,
     burn_me,
     content_deck,
+    content_duel,
     delete_monitor,
     fitcheck_streak,
     leaderboard,
@@ -96,6 +97,13 @@ class SableRolesClient(discord.Client):
         # default → no registration (invisible). NEVER touches the global tree, so the
         # copy_global_to loop below can never fan it onto a live client guild.
         content_deck_guilds = content_deck.register_commands(self.tree, client=self)
+        # Phase-5 community duel (/duel + /tasteboard) — GLOBAL commands fanned onto
+        # the live GUILD_TO_ORG guilds by the copy_global_to loop below (the OPPOSITE
+        # registration posture from the Phase-0 content_deck spike above, on purpose).
+        # Authorization is at RUNTIME: org mapping + MOD_ROLES duel trigger + the
+        # FAIL-CLOSED per-org `pairwise_disclosure_signed` gate — an org with no signed
+        # disclosure gets a polite refusal, never a duel.
+        content_duel.register_commands(self.tree)
         # Per-guild instant sync via copy_global_to (SableTracking pattern).
         for guild_id_str in GUILD_TO_ORG:
             guild = discord.Object(id=int(guild_id_str))
