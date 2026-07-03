@@ -46,7 +46,7 @@ try:
 except ImportError:  # older SablePlatform without the accessor — the gate FAILS CLOSED
     get_org_config_value = None  # type: ignore[assignment]
 
-from sable_roles.config import GUILD_TO_ORG
+from sable_roles.config import DUEL_STARTERS, GUILD_TO_ORG
 from sable_roles.features.fitcheck_streak import _is_mod
 
 logger = logging.getLogger("sable_roles.content_duel")
@@ -77,6 +77,17 @@ _OPEN_DUELS: dict[str, float] = {}
 
 def _org_for(guild_id: int | str | None) -> str | None:
     return GUILD_TO_ORG.get(str(guild_id)) if guild_id is not None else None
+
+
+def _can_start_duel(member: discord.Member, guild_id: str) -> bool:
+    """The /duel trigger gate. When the guild has a NON-EMPTY ``DUEL_STARTERS`` entry,
+    that NAMED user-id allowlist is the ONLY trigger (roles deliberately ignored — the
+    operator's "by username not by role for now"); an unconfigured guild falls back to
+    the MOD_ROLES role gate. Both paths fail closed when unconfigured."""
+    starters = DUEL_STARTERS.get(guild_id) or []
+    if starters:
+        return str(member.id) in {str(s) for s in starters}
+    return _is_mod(member, guild_id)
 
 
 def _now_iso() -> str:
@@ -341,10 +352,10 @@ async def _handle_duel(interaction: discord.Interaction) -> None:
         )
         return
     member = interaction.user
-    if not isinstance(member, discord.Member) or not _is_mod(member, str(interaction.guild_id)):
+    if not isinstance(member, discord.Member) or not _can_start_duel(member, str(interaction.guild_id)):
         await interaction.response.send_message(
-            "duels are mod-triggered — ask a mod to start one.", ephemeral=True,
-            allowed_mentions=_NO_MENTIONS,
+            "duels are started by the Sable team — ask one of them to run one.",
+            ephemeral=True, allowed_mentions=_NO_MENTIONS,
         )
         return
     if not await asyncio.to_thread(_disclosure_signed, org):

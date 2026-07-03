@@ -28,6 +28,7 @@ from sable_roles.features import content_duel as mod
 def duel_env(monkeypatch, db_conn):
     """content_duel wired to the in-memory SP db + a solstitch test guild."""
     monkeypatch.setattr(mod, "GUILD_TO_ORG", {"100": "solstitch"})
+    monkeypatch.setattr(mod, "DUEL_STARTERS", {})  # tests opt in per-case
 
     @contextlib.contextmanager
     def _fake_get_db():
@@ -135,14 +136,48 @@ async def test_unmapped_guild_refused(duel_env):
     assert "isn't configured" in _sent_text(i)
 
 
-# --- the mod trigger gate -----------------------------------------------------
+# --- the trigger gate (named starters first, mod roles as fallback) -------------
 
 async def test_non_mod_cannot_start_a_duel(duel_env):
     _sign_disclosure(duel_env)
-    i = _interaction(_member(1, role_ids=("777",)))  # not the mod role
+    i = _interaction(_member(1, role_ids=("777",)))  # not the mod role, no starters set
     await mod._handle_duel(i)
-    assert "mod" in _sent_text(i)
+    assert "Sable team" in _sent_text(i)
     assert _sent_kwargs(i)["ephemeral"] is True
+
+
+async def test_named_starter_can_duel_without_any_role(monkeypatch, duel_env):
+    """The operator ask: Arf/P0ison/Monasex start duels BY USERNAME — no role needed."""
+    monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["402620324744790017"]})
+    _sign_disclosure(duel_env)
+    _seed_pending(duel_env, 1)
+    _seed_pending(duel_env, 2)
+    i = _interaction(_member(402620324744790017, role_ids=()))  # zero roles
+    await mod._handle_duel(i)
+    i.channel.send.assert_called_once()  # the duel posted
+
+
+async def test_starters_configured_means_roles_are_ignored(monkeypatch, duel_env):
+    """'By username NOT by role': with a starters list set, even a full MOD-role holder
+    who isn't on the list is refused."""
+    monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["402620324744790017"]})
+    _sign_disclosure(duel_env)
+    _seed_pending(duel_env, 1)
+    _seed_pending(duel_env, 2)
+    i = _interaction(_member(999, role_ids=("555",)))  # the mod role — still refused
+    await mod._handle_duel(i)
+    assert "Sable team" in _sent_text(i)
+    i.channel.send.assert_not_called()
+
+
+async def test_unconfigured_guild_falls_back_to_mod_roles(monkeypatch, duel_env):
+    monkeypatch.setattr(mod, "DUEL_STARTERS", {})
+    _sign_disclosure(duel_env)
+    _seed_pending(duel_env, 1)
+    _seed_pending(duel_env, 2)
+    i = _interaction(_member(1, role_ids=("555",)))  # the mod role works as before
+    await mod._handle_duel(i)
+    i.channel.send.assert_called_once()
 
 
 async def test_thin_deck_refused(duel_env):

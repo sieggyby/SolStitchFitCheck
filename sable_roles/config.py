@@ -52,6 +52,16 @@ MOD_ROLES: dict = json.loads(
 # REFUSES any guild that is also in GUILD_TO_ORG (a live client guild) — /content-deck
 # is test-only and must run on a SEPARATE bot token whose bot is in no live guild.
 # See features/content_deck.py + ~/sable-workspace/CONTENT_DECK_MASTERPLAN.md Phase 0.
+# Phase-5 community duel — NAMED duel-starters per guild (the operator ask: "let Arf,
+# P0ison, and Monasex start the duels — by username not by role for now"). Shape:
+# {"<guild_id>": ["<discord_user_id>", ...]}. When a guild has a NON-EMPTY entry here,
+# the /duel trigger is THIS allowlist ONLY (roles ignored); when absent, the trigger
+# falls back to MOD_ROLES. Discord user ids are global, so the same trio works across
+# client servers. Voting stays open to everyone either way.
+DUEL_STARTERS: dict = json.loads(
+    os.environ.get("SABLE_ROLES_DUEL_STARTERS_JSON", "{}")
+)
+
 CONTENT_DECK_GUILDS: dict = json.loads(
     os.environ.get("SABLE_ROLES_CONTENT_DECK_GUILDS_JSON", "{}")
 )
