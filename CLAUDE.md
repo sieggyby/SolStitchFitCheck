@@ -204,7 +204,7 @@ Bot deletes any text-only post, including from `@Atelier` (admins). Discord role
 
 ### Community Content Duel (Phase 5, `features/content_duel.py` — LIVE on SolStitch 2026-07-02)
 
-**One-line:** mod-triggered `/duel` posts two pending Content-Deck candidates into the client channel; members vote 🅰/🅱 (one vote each); votes are preference data for Sable's content engine, QUARANTINED from the operator Elo; `/tasteboard` shows the community leaderboard.
+**One-line:** operator-triggered `/duel` (NAMED starters via `SABLE_ROLES_DUEL_STARTERS_JSON` — Arf/P0ison/Monasex by user id, key-presence semantics: explicit `[]` = locked, absent key = MOD_ROLES fallback) posts two pending Content-Deck candidates into the client channel; members vote 🅰/🅱 (one vote each); votes are preference data for Sable's content engine, QUARANTINED from the operator Elo; `/tasteboard` shows the community leaderboard.
 
 **THE DISCLOSURE GATE (fail-closed — the consent boundary):** every command re-checks `orgs.config_json.pairwise_disclosure_signed` AT INVOCATION via `get_org_config_value` (defensive import — an old SablePlatform fails the gate closed, never boot-crashes the bot). Non-empty NON-SENTINEL string required (`"false"`/`"no"`/`"revoked"`/`"off"`/`"0"`… refuse — `_REVOKED_SENTINELS`); any error refuses. Member-facing disclosure rides every duel embed footer. Registration is NOT authorization: `/duel`+`/tasteboard` are GLOBAL-tree commands fanned onto GUILD_TO_ORG guilds (the OPPOSITE posture from the content_deck Phase-0 spike, which stays test-only + untouched) — an unsigned org gets a polite refusal.
 
