@@ -104,16 +104,31 @@ class SableRolesClient(discord.Client):
         # FAIL-CLOSED per-org `pairwise_disclosure_signed` gate — an org with no signed
         # disclosure gets a polite refusal, never a duel.
         content_duel.register_commands(self.tree)
-        # Per-guild instant sync via copy_global_to (SableTracking pattern).
+        # Per-guild instant sync via copy_global_to (SableTracking pattern). Each guild's
+        # sync is FAILURE-ISOLATED (the long-planned Item-2 hardening, SableTracking
+        # bot.py precedent): a Forbidden/HTTP error on ONE guild — e.g. a guild staged
+        # in GUILD_TO_ORG before the bot is invited (the TIG onboarding order) — logs
+        # loudly and skips, instead of crashing the whole bot out of every live guild.
         for guild_id_str in GUILD_TO_ORG:
             guild = discord.Object(id=int(guild_id_str))
             self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
+            try:
+                await self.tree.sync(guild=guild)
+            except discord.HTTPException as exc:
+                logger.error(
+                    "command sync FAILED for guild %s (bot not invited yet, or missing "
+                    "applications.commands scope?) — skipping; other guilds unaffected: %s",
+                    guild_id_str, exc,
+                )
         # Sync the guild-scoped /content-deck onto its TEST guilds only (these are NOT in
         # GUILD_TO_ORG by construction — _safe_test_guilds refuses overlap — so the loop
         # above did not touch them; sync pushes ONLY the guild-scoped command, no globals).
         for gid in content_deck_guilds:
-            await self.tree.sync(guild=discord.Object(id=int(gid)))
+            try:
+                await self.tree.sync(guild=discord.Object(id=int(gid)))
+            except discord.HTTPException as exc:
+                logger.error("content-deck test-guild sync FAILED for %s — skipping: %s",
+                             gid, exc)
 
     async def on_ready(self) -> None:
         logger.info(
