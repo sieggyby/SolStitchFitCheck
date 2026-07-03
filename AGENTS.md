@@ -200,6 +200,22 @@ Bot deletes any text-only post, including from `@Atelier` (admins). Discord role
 
 ---
 
+---
+
+### Community Content Duel (Phase 5, `features/content_duel.py` — LIVE on SolStitch 2026-07-02)
+
+**One-line:** mod-triggered `/duel` posts two pending Content-Deck candidates into the client channel; members vote 🅰/🅱 (one vote each); votes are preference data for Sable's content engine, QUARANTINED from the operator Elo; `/tasteboard` shows the community leaderboard.
+
+**THE DISCLOSURE GATE (fail-closed — the consent boundary):** every command re-checks `orgs.config_json.pairwise_disclosure_signed` AT INVOCATION via `get_org_config_value` (defensive import — an old SablePlatform fails the gate closed, never boot-crashes the bot). Non-empty NON-SENTINEL string required (`"false"`/`"no"`/`"revoked"`/`"off"`/`"0"`… refuse — `_REVOKED_SENTINELS`); any error refuses. Member-facing disclosure rides every duel embed footer. Registration is NOT authorization: `/duel`+`/tasteboard` are GLOBAL-tree commands fanned onto GUILD_TO_ORG guilds (the OPPOSITE posture from the content_deck Phase-0 spike, which stays test-only + untouched) — an unsigned org gets a polite refusal.
+
+**Vote integrity:** the repo's FIRST non-author-locked View. One vote per member enforced twice — a SYNCHRONOUS pre-mark in the View dict BEFORE any await (discord.py dispatches each click as its own task; the pre-mark closes the double-click race the durable guard can't see mid-transaction; rolled back on write failure) + the durable `has_recent_duel_vote` DB guard (survives restarts). Blind count-only tally while open (no herding); A/B split reveals at close. HARD 10-min wall-clock deadline (`_DUEL_OPEN_SECONDS` + a monotonic `_deadline`; `View.timeout` alone is a refreshable INACTIVITY timer — after each vote it is shrunk to the remaining wall-clock). Vote DB work runs via `asyncio.to_thread` (the gateway event loop never stalls on Postgres). One open duel per org (`_OPEN_DUELS`, in-process — single-process constraint; cleared `.clear()`-style in tests). The duel posts as a REGULAR bot channel message (interaction webhook tokens expire at 15 min — an interaction-owned message could not be edited at close). Strict public-render whitelist: ONLY `payload.text` / `[format] captions` ever reach the channel — an unrecognized payload renders "" and the candidate is dropped (guardrail_hits / internal fields never post). `AllowedMentions.none()` on every send/edit.
+
+**The quarantine (SP side):** votes land as `content_deck_decisions` rows (`actor_kind='community'`, `surface='discord'`, `decision='keep'` + `pair_loser_id`) and fold into `community:`-prefixed `content_quality` rows at BOTH grains — no operator-Elo consumer (deck ranking, meme template loop, text format tilt, keep-rate, hard-negatives) reads prefixed keys. Promotion past the quarantine is gated on the masterplan §11 K-tests, a deliberate future change.
+
+**Known limits (documented, accepted for v1):** views are non-persistent — a bot restart orphans an open duel's buttons ("interaction failed"; the vote ledger survives, the tally never reveals); the org lock is in-process; candidate images aren't embedded (pending candidates have no R2 ref — needs a render endpoint). Activation for a NEW org = bot in guild + GUILD_TO_ORG entry + `sable-platform org config set <org> pairwise_disclosure_signed "<date + who + authority>"`. TIG is prepped but NOT active (needs the guild invite + client confirmation). Record: `~/sable-workspace/CONTENT_DECK_PHASE5_SHIPPED.md`. Tests: `tests/test_content_duel.py` (20).
+
+---
+
 ## Working conventions
 
 - **Small patches over rewrites.** Don't refactor `fitcheck_streak.py` cosmetically — it was audited byte-for-byte against the build plan across 5 chunks.
