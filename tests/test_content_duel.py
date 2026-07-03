@@ -395,3 +395,16 @@ async def test_tasteboard_gated_and_renders(duel_env):
     kwargs = _sent_kwargs(i3)
     assert kwargs["ephemeral"] is True
     assert "1 votes" in kwargs["embed"].description
+
+
+async def test_explicit_empty_starters_locks_duels(monkeypatch, duel_env):
+    """Codex: an EXPLICIT empty starters entry means locked — never a silent
+    fall-through to the role gate."""
+    monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": []})
+    _sign_disclosure(duel_env)
+    _seed_pending(duel_env, 1)
+    _seed_pending(duel_env, 2)
+    i = _interaction(_member(1, role_ids=("555",)))  # even the mod role is refused
+    await mod._handle_duel(i)
+    assert "Sable team" in _sent_text(i)
+    i.channel.send.assert_not_called()

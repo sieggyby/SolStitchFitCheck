@@ -84,9 +84,10 @@ def _can_start_duel(member: discord.Member, guild_id: str) -> bool:
     that NAMED user-id allowlist is the ONLY trigger (roles deliberately ignored — the
     operator's "by username not by role for now"); an unconfigured guild falls back to
     the MOD_ROLES role gate. Both paths fail closed when unconfigured."""
-    starters = DUEL_STARTERS.get(guild_id) or []
-    if starters:
-        return str(member.id) in {str(s) for s in starters}
+    if guild_id in DUEL_STARTERS:
+        # key PRESENCE selects the allowlist path — an explicit empty list means
+        # "locked: nobody starts duels", never a silent fall-through to roles (Codex).
+        return str(member.id) in {str(s) for s in DUEL_STARTERS[guild_id] or []}
     return _is_mod(member, guild_id)
 
 
