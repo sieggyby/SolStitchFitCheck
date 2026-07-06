@@ -2,7 +2,7 @@
 
 Live-ops doc for the SolStitch fit-check bot (and future tenants). Source of truth for boot, monitoring, restart, deployment, and rollback procedures.
 
-**Status:** V1 running locally on Sieggy's machine since 2026-05-13. VPS deploy targeted within 24-48h.
+**Status:** Live in the SolStitch Discord — V1 since 2026-05-13; V2 stack (burn-me/roast/vibe/airlock) on the Hetzner VPS since 2026-05-16, running as the `stitzy` container in the `sable-web` compose project (see the VPS section below). The Phase-5 **community content duel** (`/duel` + `/tasteboard`, named starters, fail-closed disclosure gate) is live since 2026-07-02. Scored Mode + state-pin are MERGED and ship disabled — enabling them is a per-guild operator decision. As of the 2026-07-05 reconcile, `origin/main` mirrors the deployed branch.
 
 For project context: `CLAUDE.md` / `AGENTS.md`. For the build plan: `~/Projects/SolStitch/internal/fitcheck_v1_build_plan.md`. For the live-ship checklist: `~/Projects/SolStitch/internal/ship_dms.md`.
 
