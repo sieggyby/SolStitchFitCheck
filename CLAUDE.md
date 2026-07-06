@@ -218,6 +218,8 @@ Bot deletes any text-only post, including from `@Atelier` (admins). Discord role
 
 ## Working conventions
 
+- **Ship rule — keep `origin/main` fast-forwarded (2026-07-05 reconcile).** `origin/main` now mirrors the deployed feature branch. After every ship (commits landed on the working branch + deployed), fast-forward it: `git push origin HEAD:main`. If that push is rejected as non-fast-forward, STOP — main has diverged; reconcile deliberately (audit for unique content first, as in `~/sable-workspace/ORIGIN_MAIN_RECONCILE_PLAN.md`), never force-push.
+
 - **Small patches over rewrites.** Don't refactor `fitcheck_streak.py` cosmetically — it was audited byte-for-byte against the build plan across 5 chunks.
 - **Tests use `pytest-asyncio` in `asyncio_mode=auto`.** Don't add explicit `@pytest.mark.asyncio` decorators — `pyproject.toml` sets the mode globally.
 - **`conftest.py` fixture `fitcheck_module` patches the three module-level dicts** (`FITCHECK_CHANNELS`, `_FITCHECK_CHANNEL_IDS`, `_CHANNEL_TO_GUILD`, `_pending_recomputes`) per test. Any new module-level state needs to be added there or tests will leak state across runs.
