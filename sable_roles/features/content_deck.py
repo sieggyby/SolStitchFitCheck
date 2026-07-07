@@ -118,6 +118,9 @@ def _load_cards(org: str, operator_handle: str) -> list[dict]:
     try:
         with get_db() as conn:
             rows = cd_db.list_deck_candidates(conn, org, operator_handle)
+        # community_tweet is duel-only ingest (the no-repost wall, W6) — a real member
+        # tweet must never be swipeable, even on a test guild mapped to a live org.
+        rows = [r for r in rows if r["kind"] != "community_tweet"]
         if rows:
             return [
                 {

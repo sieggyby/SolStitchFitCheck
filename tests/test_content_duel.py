@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -19,6 +20,7 @@ import pytest
 from sqlalchemy import text
 
 from sable_platform.db import content_deck as cd_db
+from sable_roles.features import content_deck as deck_mod
 from sable_roles.features import content_duel as mod
 
 
@@ -65,6 +67,41 @@ def _seed_pending(conn, cid, *, kind="tweet", payload='{"text": "candidate text"
         (cid, kind, payload),
     )
     conn.commit()
+
+
+def _set_duel_kinds(conn, kinds_value, org="solstitch"):
+    """Write orgs.config_json carrying BOTH the signed disclosure and a duel_kinds
+    value (a real list, a JSON-string-encoded list, or garbage — whatever the test
+    needs the org config to hold)."""
+    cfg = {
+        "pairwise_disclosure_signed": "2026-07-07 sieggy — full-reign",
+        "duel_kinds": kinds_value,
+    }
+    conn.execute(
+        "UPDATE orgs SET config_json = ? WHERE org_id = ?", (json.dumps(cfg), org)
+    )
+    conn.commit()
+
+
+def _ct_payload(*, author="gabbyvorbeck", engagement=None, as_of="2026-07-07T18:00:00Z",
+                text_="real tweet from the community", drop=()):
+    """A §1.1-shaped community_tweet payload (internal fields included — they must
+    never render). `drop` removes keys to build the invalid variants."""
+    p = {
+        "text": text_,
+        "author_handle": author,
+        "author_name": "Gabby",
+        "x_id": "1938291000000000000",
+        "url": f"https://x.com/{author}/status/1938291000000000000",
+        "posted_at": "2026-06-28T14:03:00Z",
+        "engagement": engagement if engagement is not None else
+            {"likes": 120, "retweets": 18, "replies": 22, "quotes": 3, "views": 15400},
+        "engagement_as_of": as_of,
+        "ingest_batch": "2026-07-07",
+    }
+    for key in drop:
+        p.pop(key, None)
+    return json.dumps(p)
 
 
 def _member(user_id: int, *, role_ids=("555",), is_member=True):
@@ -408,3 +445,241 @@ async def test_explicit_empty_starters_locks_duels(monkeypatch, duel_env):
     await mod._handle_duel(i)
     assert "Sable team" in _sent_text(i)
     i.channel.send.assert_not_called()
+
+
+# --- duel_kinds pool selection (community-tweet duels, mig 083) ------------------
+
+async def test_duel_kinds_community_only_never_pairs_ai(duel_env):
+    """duel_kinds=["community_tweet"] (a REAL list — org config may store the list
+    itself) restricts the pool: an AI card never pairs even with tweets/memes pending."""
+    _set_duel_kinds(duel_env, ["community_tweet"])
+    _seed_pending(duel_env, 1, kind="community_tweet", payload=_ct_payload(author="gabbyvorbeck"))
+    _seed_pending(duel_env, 2, kind="community_tweet", payload=_ct_payload(author="syebastian"))
+    _seed_pending(duel_env, 3, kind="tweet")
+    _seed_pending(duel_env, 4, kind="meme",
+                  payload='{"template_id":"drake","format":"Drake","captions":{"a":"x","b":"y"}}')
+    i = _interaction(_member(1))
+    await mod._handle_duel(i)
+    view = i.channel.send.call_args.kwargs["view"]
+    assert {view._card_a["id"], view._card_b["id"]} == {1, 2}
+    assert view._card_a["kind"] == view._card_b["kind"] == "community_tweet"
+
+
+async def test_json_string_encoded_duel_kinds_accepted(duel_env):
+    """org config may also store duel_kinds as a JSON-STRING-encoded list — parsed,
+    not refused."""
+    _set_duel_kinds(duel_env, '["community_tweet"]')
+    _seed_pending(duel_env, 1, kind="community_tweet", payload=_ct_payload(author="gabbyvorbeck"))
+    _seed_pending(duel_env, 2, kind="community_tweet", payload=_ct_payload(author="syebastian"))
+    _seed_pending(duel_env, 3, kind="tweet")
+    i = _interaction(_member(1))
+    await mod._handle_duel(i)
+    view = i.channel.send.call_args.kwargs["view"]
+    assert {view._card_a["id"], view._card_b["id"]} == {1, 2}
+
+
+async def test_explicit_empty_duel_kinds_refuses(duel_env):
+    """Explicit-empty-means-locked (the DUEL_STARTERS convention, audit S4): a
+    present-but-EMPTY duel_kinds refuses the duel — never a silent full-pool
+    fall-through."""
+    _set_duel_kinds(duel_env, [])
+    _seed_pending(duel_env, 1)
+    _seed_pending(duel_env, 2)
+    i = _interaction(_member(1))
+    await mod._handle_duel(i)
+    assert "duel_kinds" in _sent_text(i)
+    assert _sent_kwargs(i)["ephemeral"] is True
+    i.channel.send.assert_not_called()
+
+
+@pytest.mark.parametrize("kinds_value", [
+    "not-json[",              # malformed JSON string
+    '"tweet"',                # valid JSON, not a list
+    42,                       # non-list, non-string
+    {"kinds": ["tweet"]},     # non-list container
+    ["hologram"],             # unknown kind (outside the mig-083 CHECK set)
+    ["tweet", 42],            # non-string entry
+])
+async def test_bad_duel_kinds_config_refuses(duel_env, kinds_value):
+    """FAIL-CLOSED: a duel_kinds value we don't positively recognize refuses the duel
+    — a typo'd config must never widen the pool."""
+    _set_duel_kinds(duel_env, kinds_value)
+    _seed_pending(duel_env, 1)
+    _seed_pending(duel_env, 2)
+    i = _interaction(_member(1))
+    await mod._handle_duel(i)
+    assert "duel_kinds" in _sent_text(i)
+    i.channel.send.assert_not_called()
+
+
+async def test_no_config_org_calls_pair_accessor_without_kinds_kwarg(monkeypatch, duel_env):
+    """SolStitch regression pin (audit F1, load-bearing): with NO duel_kinds config the
+    SP accessor is called WITHOUT the kinds kwarg — byte-identical to the pre-083 call
+    shape, so a stale baked SablePlatform (old signature) can never TypeError the
+    unconfigured path into "not enough candidates"."""
+    _sign_disclosure(duel_env)  # config carries ONLY the disclosure — no duel_kinds key
+    _seed_pending(duel_env, 1)
+    _seed_pending(duel_env, 2)
+    real = cd_db.get_deck_duel_pair
+    calls = []
+
+    def _capture(*args, **kwargs):
+        calls.append((args, kwargs))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(mod.cd_db, "get_deck_duel_pair", _capture)
+    i = _interaction(_member(1))
+    await mod._handle_duel(i)
+    i.channel.send.assert_called_once()  # behavior unchanged: the duel posted
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert len(args) == 2  # (conn, org) positionally
+    assert kwargs == {}  # and NOTHING else — no kinds kwarg
+
+
+# --- community card render + reveal ----------------------------------------------
+
+async def _open_community_duel(duel_env, *, hi_engagement=None, lo_engagement=None):
+    """Two community cards (id 1 = high engagement, id 2 = low), duel opened.
+    Returns (view, posted_kwargs)."""
+    _set_duel_kinds(duel_env, ["community_tweet"])
+    hi = hi_engagement or {"likes": 120, "retweets": 18, "replies": 22, "quotes": 3, "views": 15400}
+    lo = lo_engagement or {"likes": 10, "retweets": 2, "replies": 5, "quotes": 0, "views": 900}
+    _seed_pending(duel_env, 1, kind="community_tweet",
+                  payload=_ct_payload(author="gabbyvorbeck", engagement=hi))
+    _seed_pending(duel_env, 2, kind="community_tweet",
+                  payload=_ct_payload(author="syebastian", engagement=lo))
+    i = _interaction(_member(1))
+    await mod._handle_duel(i)
+    kwargs = i.channel.send.call_args.kwargs
+    return kwargs["view"], kwargs
+
+
+async def test_community_cards_render_author_and_variant_footer(duel_env):
+    view, kwargs = await _open_community_duel(duel_env)
+    embed = kwargs["embed"]
+    f_a, f_b = embed.fields[0], embed.fields[1]
+    assert f_a.name.startswith("🅰 · @") and f_b.name.startswith("🅱 · @")
+    assert {f_a.name.split("@")[1], f_b.name.split("@")[1]} == {"gabbyvorbeck", "syebastian"}
+    assert "real tweets from this community" in embed.footer.text
+    assert "guess which popped" in embed.footer.text
+    # the open tally stays BLIND: count only — no split, no reality, no numbers
+    assert embed.fields[2].name == "votes" and embed.fields[2].value == "0"
+    assert all(f.name != "reality" for f in embed.fields)
+    v = _interaction(_member(10, role_ids=()))
+    await view._vote(v, "a")
+    open_embed = v.response.edit_message.call_args.kwargs["embed"]
+    open_text = " ".join(f"{f.name} {f.value}" for f in open_embed.fields)
+    assert "votes 1" in open_text
+    assert "reality" not in open_text and "popped" not in open_text
+
+
+async def test_close_reveals_weighted_reality_and_room_verdict(duel_env):
+    """The reveal: WEIGHTED score (likes + 2·RT + replies + quotes), the popped
+    verdict, the room-vs-reality line, and the as-of date in the closed footer."""
+    view, _ = await _open_community_duel(duel_env)
+    hi_is_a = view._card_a["id"] == 1  # RANDOM() pair order — resolve which side is which
+    v = _interaction(_member(10, role_ids=()))
+    await view._vote(v, "a" if hi_is_a else "b")  # the room picks the popped card
+    msg = MagicMock(spec=discord.Message)
+    msg.edit = AsyncMock()
+    view.bind_message(msg)
+    await view.on_timeout()
+    closed_embed = msg.edit.call_args.kwargs["embed"]
+    reality = next(f for f in closed_embed.fields if f.name == "reality").value
+    if hi_is_a:  # hi: 120 + 2*18 + 22 + 3 = 181 · lo: 10 + 2*2 + 5 + 0 = 19
+        assert reality.startswith("🅰 score 181 (120❤ 18🔁 22💬 3❞) · 🅱 score 19 — 🅰 popped")
+    else:
+        assert reality.startswith("🅰 score 19 (10❤ 2🔁 5💬 0❞) · 🅱 score 181 — 🅱 popped")
+    assert "the room called it" in reality
+    assert "numbers as of 2026-07-07" in closed_embed.footer.text
+    assert "real tweets from this community" in closed_embed.footer.text
+
+
+async def test_close_reveal_upset_when_room_picked_the_flop(duel_env):
+    view, _ = await _open_community_duel(duel_env)
+    hi_is_a = view._card_a["id"] == 1
+    v = _interaction(_member(10, role_ids=()))
+    await view._vote(v, "b" if hi_is_a else "a")  # the room picks the LOW card
+    msg = MagicMock(spec=discord.Message)
+    msg.edit = AsyncMock()
+    view.bind_message(msg)
+    await view.on_timeout()
+    reality = next(
+        f for f in msg.edit.call_args.kwargs["embed"].fields if f.name == "reality"
+    ).value
+    assert "upset — the room picked the other one" in reality
+    assert "the room called it" not in reality
+
+
+async def test_close_reveal_omits_room_line_on_vote_tie(duel_env):
+    """No votes (0–0) → nothing to compare — the room-vs-reality line is omitted,
+    the reality numbers still show."""
+    view, _ = await _open_community_duel(duel_env)
+    msg = MagicMock(spec=discord.Message)
+    msg.edit = AsyncMock()
+    view.bind_message(msg)
+    await view.on_timeout()
+    reality = next(
+        f for f in msg.edit.call_args.kwargs["embed"].fields if f.name == "reality"
+    ).value
+    assert "popped" in reality
+    assert "room" not in reality and "upset" not in reality
+
+
+@pytest.mark.parametrize("bad_payload", [
+    _ct_payload(author="not a handle!"),           # invalid handle characters
+    _ct_payload(author="a" * 16),                  # too long for an X handle
+    _ct_payload(author="gabbyvorbeck\n"),          # trailing newline ("$" quirk)
+    _ct_payload(drop=("author_handle",)),          # author missing
+    _ct_payload(drop=("engagement",)),             # engagement missing
+    _ct_payload(engagement={"likes": "many", "retweets": 1, "replies": 1, "quotes": 1}),
+    _ct_payload(engagement={"likes": 1, "retweets": 2}),  # counter keys missing
+])
+async def test_invalid_community_card_is_dropped(duel_env, bad_payload):
+    """A community card with a bad author or bad numbers is DROPPED — the duel refuses
+    on <2 valid cards rather than render a fake attribution or reveal a wrong score."""
+    _set_duel_kinds(duel_env, ["community_tweet"])
+    _seed_pending(duel_env, 1, kind="community_tweet", payload=bad_payload)
+    _seed_pending(duel_env, 2, kind="community_tweet", payload=_ct_payload())
+    i = _interaction(_member(1))
+    await mod._handle_duel(i)
+    assert "not enough" in _sent_text(i)
+    i.channel.send.assert_not_called()
+
+
+async def test_community_votes_still_write_actor_kind_community(duel_env):
+    """The vote substrate is UNCHANGED on the community path: keep + pair_loser_id,
+    actor_kind='community', surface='discord'."""
+    view, _ = await _open_community_duel(duel_env)
+    v = _interaction(_member(10, role_ids=()))
+    await view._vote(v, "a")
+    row = duel_env.execute(
+        "SELECT actor, actor_kind, decision, surface, candidate_id, pair_loser_id "
+        "FROM content_deck_decisions"
+    ).fetchone()
+    assert row[0] == "discord:user:10" and row[1] == "community"
+    assert row[2] == "keep" and row[3] == "discord"
+    assert {row[4], row[5]} == {1, 2}
+
+
+# --- W6: the Phase-0 swipe spike never serves a community tweet -------------------
+
+async def test_spike_feed_excludes_community_tweet(monkeypatch, duel_env):
+    """W6 (audit F12a): a test guild mapped to a live org must never swipe an ingested
+    member tweet — the no-repost wall covers the spike's durable feed too."""
+    _seed_pending(duel_env, 1, kind="community_tweet", payload=_ct_payload())
+    _seed_pending(duel_env, 2, kind="tweet")
+
+    @contextlib.contextmanager
+    def _fake_get_db():
+        yield duel_env
+
+    monkeypatch.setattr(deck_mod, "get_db", _fake_get_db)
+    cards = deck_mod._load_cards("solstitch", "discord:user:1")
+    assert [c["id"] for c in cards] == [2]  # the community row is gone, the tweet stays
+    # an all-community durable feed degrades to the static seed, as if it were empty
+    duel_env.execute("DELETE FROM content_candidates WHERE id = 2")
+    duel_env.commit()
+    cards = deck_mod._load_cards("solstitch", "discord:user:1")
+    assert cards and all(c["id"] is None for c in cards)
