@@ -104,12 +104,14 @@ def _ct_payload(*, author="gabbyvorbeck", engagement=None, as_of="2026-07-07T18:
     return json.dumps(p)
 
 
-def _member(user_id: int, *, role_ids=("555",), is_member=True):
+def _member(user_id: int, *, role_ids=("555",), is_member=True, manage_guild=False):
     member = MagicMock(spec=discord.Member if is_member else discord.User)
     member.id = user_id
     member.bot = False
     if is_member:
         member.roles = [SimpleNamespace(id=r) for r in role_ids]
+        # deterministic — a bare MagicMock's .manage_guild would read truthy
+        member.guild_permissions = SimpleNamespace(manage_guild=manage_guild)
     return member
 
 
@@ -179,7 +181,7 @@ async def test_non_mod_cannot_start_a_duel(duel_env):
     _sign_disclosure(duel_env)
     i = _interaction(_member(1, role_ids=("777",)))  # not the mod role, no starters set
     await mod._handle_duel(i)
-    assert "Sable team" in _sent_text(i)
+    assert "ask one of them" in _sent_text(i)
     assert _sent_kwargs(i)["ephemeral"] is True
 
 
@@ -203,7 +205,7 @@ async def test_starters_configured_means_roles_are_ignored(monkeypatch, duel_env
     _seed_pending(duel_env, 2)
     i = _interaction(_member(999, role_ids=("555",)))  # the mod role — still refused
     await mod._handle_duel(i)
-    assert "Sable team" in _sent_text(i)
+    assert "ask one of them" in _sent_text(i)
     i.channel.send.assert_not_called()
 
 
@@ -238,7 +240,7 @@ async def test_duel_posts_public_embed_with_disclosure(duel_env):
     # the interaction response is just an ephemeral ack to the triggering mod.
     kwargs = i.channel.send.call_args.kwargs
     embed = kwargs["embed"]
-    assert "train Sable's content engine" in embed.footer.text  # member-facing disclosure
+    assert "your vote is recorded" in embed.footer.text  # member-facing disclosure
     assert isinstance(kwargs["view"], mod._DuelView)
     assert kwargs["allowed_mentions"] is not None
     assert _sent_kwargs(i)["ephemeral"] is True  # the mod ack
@@ -443,7 +445,7 @@ async def test_explicit_empty_starters_locks_duels(monkeypatch, duel_env):
     _seed_pending(duel_env, 2)
     i = _interaction(_member(1, role_ids=("555",)))  # even the mod role is refused
     await mod._handle_duel(i)
-    assert "Sable team" in _sent_text(i)
+    assert "ask one of them" in _sent_text(i)
     i.channel.send.assert_not_called()
 
 
@@ -562,7 +564,7 @@ async def test_community_cards_render_author_and_variant_footer(duel_env):
     assert f_a.name.startswith("🅰 · @") and f_b.name.startswith("🅱 · @")
     assert {f_a.name.split("@")[1], f_b.name.split("@")[1]} == {"gabbyvorbeck", "syebastian"}
     assert "real tweets from this community" in embed.footer.text
-    assert "guess which popped" in embed.footer.text
+    assert "which popped?" in embed.footer.text
     # the open tally stays BLIND: count only — no split, no reality, no numbers
     assert embed.fields[2].name == "votes" and embed.fields[2].value == "0"
     assert all(f.name != "reality" for f in embed.fields)
@@ -780,3 +782,126 @@ def test_tweet_url_is_derived_and_validated():
     assert mod._tweet_url({"author": "gabby"}) is None                    # no id
     assert mod._tweet_url({"x_id": "123456"}) is None                     # no author
     assert mod._tweet_url({"author": "gabby", "x_id": "1" * 26}) is None  # absurd length
+
+
+# --- mod-managed duel-starter whitelist (/duel-allow) + mention leaderboard ---
+
+def _config(conn, org="solstitch"):
+    return mod.get_org_config_value(conn, org, "duel_starters_extra")
+
+
+async def test_extra_starter_is_additive_and_can_start(monkeypatch, duel_env, db_conn):
+    """A member who is NOT an env starter and NOT a mod, but IS on the config
+    duel_starters_extra list, can start — checked first, purely additive."""
+    monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["111"]})  # env baseline = user 111
+    _sign_disclosure(db_conn)
+    _set_duel_kinds(db_conn, '["community_tweet"]')
+    mod.set_org_config(db_conn, "solstitch", "duel_starters_extra", json.dumps(["999"]))
+    db_conn.commit()
+    _seed_pending(db_conn, 1, kind="community_tweet", payload=_ct_payload(author="a"))
+    _seed_pending(db_conn, 2, kind="community_tweet", payload=_ct_payload(author="b"))
+    # user 999: not env-seeded (111 is), zero mod roles — allowed only via config extras
+    i = _interaction(_member(999, role_ids=()))
+    await mod._handle_duel(i)
+    i.channel.send.assert_called_once()
+
+
+async def test_extra_starters_do_not_lock_out_mod_fallback(monkeypatch, duel_env, db_conn):
+    """A guild with NO env starters uses the MOD_ROLES fallback. Adding a config extra
+    must stay ADDITIVE — a mod-role holder can STILL start (the base mode is unchanged,
+    unlike the env allowlist which is exclusive)."""
+    monkeypatch.setattr(mod, "DUEL_STARTERS", {})  # no env allowlist → MOD_ROLES fallback
+    _sign_disclosure(db_conn)
+    _set_duel_kinds(db_conn, '["community_tweet"]')
+    mod.set_org_config(db_conn, "solstitch", "duel_starters_extra", json.dumps(["999"]))
+    db_conn.commit()
+    _seed_pending(db_conn, 1, kind="community_tweet", payload=_ct_payload(author="a"))
+    _seed_pending(db_conn, 2, kind="community_tweet", payload=_ct_payload(author="b"))
+    i = _interaction(_member(42, role_ids=("555",)))  # a mod-role holder, NOT in config
+    await mod._handle_duel(i)
+    i.channel.send.assert_called_once()  # mods still start — extras never locked them out
+
+
+async def test_duel_allow_grants_persists_and_enables(duel_env, db_conn):
+    """A Manage-Server actor grants a member → config list updated → that member can
+    now start a duel."""
+    _sign_disclosure(db_conn)
+    admin = _member(1, role_ids=(), manage_guild=True)
+    target = _member(777, role_ids=())
+    i = _interaction(admin)
+    await mod._handle_starter_change(i, target, grant=True)
+    assert "777" in (json.loads(_config(db_conn)) or [])
+    assert mod._can_start_duel(target, "100", "solstitch") is True
+    assert "can now start duels" in _sent_text(i)
+
+
+async def test_duel_allow_denied_for_plain_member(duel_env, db_conn):
+    """No Manage-Server, no mod role → refused, config untouched."""
+    _sign_disclosure(db_conn)
+    plain = _member(2, role_ids=())  # no mod role, manage_guild False
+    target = _member(777, role_ids=())
+    i = _interaction(plain)
+    await mod._handle_starter_change(i, target, grant=True)
+    assert "Manage Server" in _sent_text(i)
+    assert _config(db_conn) is None  # nothing written
+
+
+async def test_duel_allow_mod_role_holder_may_manage(duel_env, db_conn):
+    """A configured MOD_ROLES holder can manage the list even without Manage-Server."""
+    _sign_disclosure(db_conn)
+    modder = _member(3, role_ids=("555",), manage_guild=False)
+    target = _member(777, role_ids=())
+    i = _interaction(modder)
+    await mod._handle_starter_change(i, target, grant=True)
+    assert "777" in (json.loads(_config(db_conn)) or [])
+
+
+async def test_duel_revoke_removes_config_but_not_env_seeded(monkeypatch, duel_env, db_conn):
+    monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["111"]})  # 111 is env-seeded
+    _sign_disclosure(db_conn)
+    mod.set_org_config(db_conn, "solstitch", "duel_starters_extra", json.dumps(["777"]))
+    db_conn.commit()
+    admin = _member(1, role_ids=(), manage_guild=True)
+
+    i = _interaction(admin)
+    await mod._handle_starter_change(i, _member(777, role_ids=()), grant=False)
+    assert "777" not in (json.loads(_config(db_conn)) or [])
+    assert "no longer" in _sent_text(i)
+
+    # env-seeded 111 can't be revoked here — reported, not removed
+    i2 = _interaction(admin)
+    await mod._handle_starter_change(i2, _member(111, role_ids=()), grant=False)
+    assert "team-seeded starter" in _sent_text(i2)
+
+
+async def test_duel_allow_rejects_bots(duel_env, db_conn):
+    _sign_disclosure(db_conn)
+    admin = _member(1, role_ids=(), manage_guild=True)
+    bot_target = _member(9, role_ids=())
+    bot_target.bot = True
+    i = _interaction(admin)
+    await mod._handle_starter_change(i, bot_target, grant=True)
+    assert "bots can't" in _sent_text(i)
+    assert _config(db_conn) is None
+
+
+async def test_leaderboard_renders_mentions_not_raw_ids(monkeypatch, duel_env, db_conn):
+    """The old code showed 'member 1234' (raw-id tail) whenever the member wasn't in the
+    gateway cache — which is ALWAYS for a bot running without the Members intent. The
+    leaderboard now renders <@id> mentions (client-resolved, no cache, no ping)."""
+    _sign_disclosure(db_conn)
+    monkeypatch.setattr(
+        mod.cd_db, "get_community_duel_leaderboard",
+        lambda conn, org: [
+            {"actor": "discord:user:402620324744790017", "votes": 7, "agreed": 0, "decided": 0},
+            {"actor": "discord:user:683759563316789266", "votes": 4, "agreed": 0, "decided": 0},
+        ],
+    )
+    i = _interaction(_member(1, role_ids=()))
+    await mod._handle_tasteboard(i)
+    desc = i.response.send_message.call_args.kwargs["embed"].description
+    assert "<@402620324744790017>" in desc and "<@683759563316789266>" in desc
+    assert "member " not in desc  # no raw-id fallback
+    # community_tweet duels never reach an ops verdict → no "called it" note, no jargon
+    footer = i.response.send_message.call_args.kwargs["embed"].footer.text
+    assert "top guessers" in footer and "ops" not in footer

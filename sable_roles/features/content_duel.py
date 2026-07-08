@@ -47,6 +47,10 @@ try:
     from sable_platform.db.orgs import get_org_config_value
 except ImportError:  # older SablePlatform without the accessor — the gate FAILS CLOSED
     get_org_config_value = None  # type: ignore[assignment]
+try:
+    from sable_platform.db.orgs import set_org_config
+except ImportError:  # older SablePlatform — /duel-allow will report unavailable, never crash
+    set_org_config = None  # type: ignore[assignment]
 
 from sable_roles.config import DUEL_STARTERS, GUILD_TO_ORG
 from sable_roles.features.fitcheck_streak import _is_mod
@@ -65,13 +69,12 @@ _NO_MENTIONS = discord.AllowedMentions.none()
 _DUEL_OPEN_SECONDS = 10 * 60
 _MAX_CARD_CHARS = 900  # embed-safe candidate text clip
 _DISCLOSURE_FOOTER = (
-    "community duel · your picks help train Sable's content engine for this community"
+    "community duel · pick the one you like better · your vote is recorded"
 )
 # The disclosure variant for an all-community pair — the "which popped?" prediction
 # game over REAL member tweets (Phase A of the community-duel plan).
 _COMMUNITY_FOOTER = (
-    "community duel · real tweets from this community · guess which popped — "
-    "picks help calibrate Sable's taste engine"
+    "which popped? · real tweets from this community · your vote is recorded"
 )
 _CONFIG_KEY = "pairwise_disclosure_signed"
 _DUEL_KINDS_KEY = "duel_kinds"
@@ -102,16 +105,53 @@ def _org_for(guild_id: int | str | None) -> str | None:
     return GUILD_TO_ORG.get(str(guild_id)) if guild_id is not None else None
 
 
-def _can_start_duel(member: discord.Member, guild_id: str) -> bool:
-    """The /duel trigger gate. When the guild has a NON-EMPTY ``DUEL_STARTERS`` entry,
-    that NAMED user-id allowlist is the ONLY trigger (roles deliberately ignored — the
-    operator's "by username not by role for now"); an unconfigured guild falls back to
-    the MOD_ROLES role gate. Both paths fail closed when unconfigured."""
+_STARTERS_KEY = "duel_starters_extra"
+
+
+def _extra_starters(org: str | None) -> set[str]:
+    """The mod-managed duel-starter allowlist stored in ``orgs.config_json`` under
+    ``duel_starters_extra`` (a JSON list of Discord user ids), granted via /duel-allow.
+    ADDITIVE to the env baseline — a whitelisted user can ALWAYS start, and this never
+    changes the base gate's mode (so granting one person can't lock out a guild's
+    MOD_ROLES holders). FAIL-SAFE: any read/parse error → empty set (falls through to
+    the base gate, never widens or locks out)."""
+    if org is None or get_org_config_value is None:
+        return set()
+    try:
+        with get_db() as conn:
+            val = get_org_config_value(conn, org, _STARTERS_KEY)
+        if isinstance(val, str):
+            val = json.loads(val)
+        if not isinstance(val, list):
+            return set()
+        return {str(x) for x in val}
+    except Exception:  # noqa: BLE001 — a broken read never grants and never locks out
+        return set()
+
+
+def _can_start_duel(member: discord.Member, guild_id: str, org: str | None = None) -> bool:
+    """The /duel trigger gate. A mod-whitelisted user (``duel_starters_extra`` config,
+    via /duel-allow) can ALWAYS start — checked first, purely additive. Otherwise: when
+    the guild has a ``DUEL_STARTERS`` env entry, that NAMED user-id allowlist is the
+    trigger (roles ignored — "by username not by role"; an explicit empty list locks the
+    env path); an unconfigured guild falls back to the MOD_ROLES role gate."""
+    if str(member.id) in _extra_starters(org):
+        return True
     if guild_id in DUEL_STARTERS:
-        # key PRESENCE selects the allowlist path — an explicit empty list means
-        # "locked: nobody starts duels", never a silent fall-through to roles (Codex).
         return str(member.id) in {str(s) for s in DUEL_STARTERS[guild_id] or []}
     return _is_mod(member, guild_id)
+
+
+def _can_manage_starters(member: discord.Member, guild_id: str) -> bool:
+    """Who may run /duel-allow, /duel-revoke, /duel-starters — a SERVER-management
+    action, so: a configured MOD_ROLES holder OR anyone with Discord's Manage Server
+    permission (real admins/mods). This works for a client guild that has no MOD_ROLES
+    configured (Manage Server is the universal signal); the duel STARTERS themselves
+    are deliberately NOT granted management (starting ≠ administering the allowlist)."""
+    if _is_mod(member, guild_id):
+        return True
+    perms = getattr(member, "guild_permissions", None)
+    return bool(perms and perms.manage_guild)
 
 
 def _now_iso() -> str:
@@ -526,6 +566,24 @@ def register_commands(tree: app_commands.CommandTree) -> None:
     async def tasteboard(interaction: discord.Interaction) -> None:  # pragma: no cover
         await _handle_tasteboard(interaction)
 
+    @tree.command(name="duel-allow", description="Let a member start duels (mods only)")
+    @app_commands.describe(user="The member to allow to run /duel")
+    async def duel_allow(  # pragma: no cover — thin shell
+        interaction: discord.Interaction, user: discord.Member
+    ) -> None:
+        await _handle_starter_change(interaction, user, grant=True)
+
+    @tree.command(name="duel-revoke", description="Stop a member from starting duels (mods only)")
+    @app_commands.describe(user="The member to stop from running /duel")
+    async def duel_revoke(  # pragma: no cover — thin shell
+        interaction: discord.Interaction, user: discord.Member
+    ) -> None:
+        await _handle_starter_change(interaction, user, grant=False)
+
+    @tree.command(name="duel-starters", description="Who can start duels here (mods only)")
+    async def duel_starters(interaction: discord.Interaction) -> None:  # pragma: no cover
+        await _handle_list_starters(interaction)
+
 
 async def _handle_duel(interaction: discord.Interaction) -> None:
     org = _org_for(interaction.guild_id)
@@ -536,9 +594,11 @@ async def _handle_duel(interaction: discord.Interaction) -> None:
         )
         return
     member = interaction.user
-    if not isinstance(member, discord.Member) or not _can_start_duel(member, str(interaction.guild_id)):
+    if not isinstance(member, discord.Member) or not _can_start_duel(
+        member, str(interaction.guild_id), org
+    ):
         await interaction.response.send_message(
-            "duels are started by the Sable team — ask one of them to run one.",
+            "duels are started by the team — ask one of them to run one.",
             ephemeral=True, allowed_mentions=_NO_MENTIONS,
         )
         return
@@ -657,17 +717,159 @@ async def _handle_tasteboard(interaction: discord.Interaction) -> None:
         )
         return
     lines = []
+    any_agreement = False
     for i, r in enumerate(rows, start=1):
         uid = r["actor"].removeprefix("discord:user:")
-        member = interaction.guild.get_member(int(uid)) if uid.isdigit() else None
-        name = member.display_name if member else f"member {uid[-4:]}"
-        agree = f" · agrees with ops {round(100 * r['agreed'] / r['decided'])}%" if r["decided"] else ""
-        lines.append(f"`{i:>2}` **{name}** · {r['votes']} votes{agree}")
+        # <@id> renders the member's name CLIENT-side (no gateway member cache, no API
+        # call, no Members intent needed — this bot runs without it) and never pings
+        # under AllowedMentions.none(). Fixes the old "member 1234" raw-id fallback.
+        who = f"<@{uid}>" if uid.isdigit() else "a member"
+        if r["decided"]:
+            any_agreement = True
+            agree = f" · called it {round(100 * r['agreed'] / r['decided'])}%"
+        else:
+            agree = ""
+        lines.append(f"`{i:>2}` {who} · {r['votes']} votes{agree}")
     embed = discord.Embed(
         description="\n".join(lines), color=discord.Color.from_str("#C8A86E"),
     )
     embed.set_author(name=f"community taste board · {org}")
-    embed.set_footer(text=_DISCLOSURE_FOOTER + " · agreement = picks matching the ops verdict")
+    footer = "top guessers in the community duels"
+    if any_agreement:
+        footer += " · “called it” = your picks that matched the result"
+    embed.set_footer(text=footer)
+    await interaction.response.send_message(
+        embed=embed, ephemeral=True, allowed_mentions=_NO_MENTIONS,
+    )
+
+
+async def _handle_starter_change(
+    interaction: discord.Interaction, user: discord.Member, *, grant: bool
+) -> None:
+    """/duel-allow + /duel-revoke — a mod adds/removes a member from the config-backed
+    duel-starter allowlist (``orgs.config_json.duel_starters_extra``). Env-seeded
+    starters are managed out-of-band and can't be revoked here (reported when tried)."""
+    org = _org_for(interaction.guild_id)
+    if org is None or interaction.guild is None:
+        await interaction.response.send_message(
+            "this server isn't configured for content duels.", ephemeral=True,
+            allowed_mentions=_NO_MENTIONS,
+        )
+        return
+    actor = interaction.user
+    if not isinstance(actor, discord.Member) or not _can_manage_starters(
+        actor, str(interaction.guild_id)
+    ):
+        await interaction.response.send_message(
+            "you need Manage Server (or a mod role) to change who can start duels.",
+            ephemeral=True, allowed_mentions=_NO_MENTIONS,
+        )
+        return
+    if user.bot:
+        await interaction.response.send_message(
+            "bots can't start duels.", ephemeral=True, allowed_mentions=_NO_MENTIONS,
+        )
+        return
+    if set_org_config is None or get_org_config_value is None:
+        await interaction.response.send_message(
+            "duel-starter management isn't available on this deployment.",
+            ephemeral=True, allowed_mentions=_NO_MENTIONS,
+        )
+        return
+
+    uid = str(user.id)
+    env_seeded = uid in {str(s) for s in DUEL_STARTERS.get(str(interaction.guild_id), []) or []}
+
+    def _apply() -> str:
+        """Read-modify-write the config list on one connection. Returns an outcome tag."""
+        with get_db() as conn:
+            raw = get_org_config_value(conn, org, _STARTERS_KEY)
+            current = []
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw)
+                except (ValueError, TypeError):
+                    raw = []
+            if isinstance(raw, list):
+                current = [str(x) for x in raw]
+            present = uid in current
+            if grant:
+                if present:
+                    return "already"
+                current.append(uid)
+            else:
+                if not present:
+                    return "absent"
+                current = [x for x in current if x != uid]
+            # store as a JSON string (set_org_config passes unknown keys through as-is)
+            set_org_config(conn, org, _STARTERS_KEY, json.dumps(current))
+            return "granted" if grant else "revoked"
+
+    try:
+        outcome = await asyncio.to_thread(_apply)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("duel-starter change failed for %s/%s: %s", org, uid, exc)
+        await interaction.response.send_message(
+            "couldn't update the duel-starter list — try again.", ephemeral=True,
+            allowed_mentions=_NO_MENTIONS,
+        )
+        return
+
+    mention = f"<@{uid}>"
+    if outcome == "granted":
+        msg = f"{mention} can now start duels."
+    elif outcome == "revoked":
+        msg = f"{mention} can no longer start duels."
+    elif outcome == "already":
+        extra = " (they're a team-seeded starter)" if env_seeded else ""
+        msg = f"{mention} could already start duels{extra}."
+    elif outcome == "absent":
+        if env_seeded:
+            msg = (f"{mention} is a team-seeded starter — that's set by the Sable team, "
+                   "not removable with this command.")
+        else:
+            msg = f"{mention} wasn't on the duel-starter list."
+    else:  # pragma: no cover — defensive
+        msg = "no change."
+    await interaction.response.send_message(
+        msg, ephemeral=True, allowed_mentions=_NO_MENTIONS,
+    )
+
+
+async def _handle_list_starters(interaction: discord.Interaction) -> None:
+    """/duel-starters — show who can start duels here (team-seeded env list + the
+    mod-granted config list), mention-rendered. Mod-gated (same as allow/revoke)."""
+    org = _org_for(interaction.guild_id)
+    if org is None or interaction.guild is None:
+        await interaction.response.send_message(
+            "this server isn't configured for content duels.", ephemeral=True,
+            allowed_mentions=_NO_MENTIONS,
+        )
+        return
+    actor = interaction.user
+    if not isinstance(actor, discord.Member) or not _can_manage_starters(
+        actor, str(interaction.guild_id)
+    ):
+        await interaction.response.send_message(
+            "you need Manage Server (or a mod role) to see the duel-starter list.",
+            ephemeral=True, allowed_mentions=_NO_MENTIONS,
+        )
+        return
+    guild_id = str(interaction.guild_id)
+    seeded = [str(s) for s in DUEL_STARTERS.get(guild_id, []) or []]
+    extra = sorted(await asyncio.to_thread(_extra_starters, org))
+    lines = []
+    if seeded:
+        lines.append("**team-seeded:** " + " ".join(f"<@{u}>" for u in seeded))
+    if extra:
+        lines.append("**mod-added:** " + " ".join(f"<@{u}>" for u in extra))
+    if not lines:
+        lines.append("no named starters — server mods start duels by role.")
+    embed = discord.Embed(
+        description="\n".join(lines), color=discord.Color.from_str("#C8A86E"),
+    )
+    embed.set_author(name=f"duel starters · {org}")
+    embed.set_footer(text="use /duel-allow @member to add someone")
     await interaction.response.send_message(
         embed=embed, ephemeral=True, allowed_mentions=_NO_MENTIONS,
     )
