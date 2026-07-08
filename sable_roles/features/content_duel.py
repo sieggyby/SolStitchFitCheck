@@ -555,6 +555,18 @@ async def _handle_duel(interaction: discord.Interaction) -> None:
         )
     except discord.HTTPException:
         _OPEN_DUELS.pop(org, None)  # never hold the lock for a duel that never posted
+        # The ack above already said "posted" — correct the record so the starter isn't
+        # left believing a duel is live somewhere (the mod-chat lesson: a private channel
+        # the bot can't access 403s HERE, after a green ack). Best-effort: the correction
+        # must never mask the original failure.
+        try:
+            await interaction.followup.send(
+                "…actually, I couldn't post the duel in this channel (no access). "
+                "run /duel in a channel where I can send messages.",
+                ephemeral=True, allowed_mentions=_NO_MENTIONS,
+            )
+        except discord.HTTPException:
+            pass
         raise
     view.bind_message(message)
     try:

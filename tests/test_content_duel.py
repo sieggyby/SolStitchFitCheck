@@ -683,3 +683,50 @@ async def test_spike_feed_excludes_community_tweet(monkeypatch, duel_env):
     duel_env.commit()
     cards = deck_mod._load_cards("solstitch", "discord:user:1")
     assert cards and all(c["id"] is None for c in cards)
+
+
+async def test_channel_send_forbidden_releases_lock_and_corrects_the_ack(monkeypatch, duel_env):
+    """The mod-chat lesson (TIG first-run, 2026-07-08): /duel in a private channel the
+    bot can't access acks "duel posted ⚔" and THEN 403s on the channel send. The org
+    lock must release (a retry elsewhere works immediately), the starter must get an
+    ephemeral correction via followup, and the Forbidden still propagates to the tree
+    log."""
+    monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["402620324744790017"]})
+    _sign_disclosure(duel_env)
+    _seed_pending(duel_env, 1)
+    _seed_pending(duel_env, 2)
+    i = _interaction(_member(402620324744790017, role_ids=()))
+    i.followup = MagicMock()
+    i.followup.send = AsyncMock()
+    resp = MagicMock()
+    resp.status = 403
+    i.channel.send = AsyncMock(side_effect=discord.Forbidden(resp, "Missing Access"))
+
+    with pytest.raises(discord.Forbidden):
+        await mod._handle_duel(i)
+
+    assert mod._OPEN_DUELS == {}  # lock released — a retry in a visible channel works now
+    i.followup.send.assert_called_once()
+    kwargs = i.followup.send.call_args.kwargs
+    assert kwargs.get("ephemeral") is True
+    text = i.followup.send.call_args.args[0]
+    assert "couldn't post" in text  # the green ack is corrected, not left standing
+
+
+async def test_ack_correction_failure_never_masks_the_original_error(monkeypatch, duel_env):
+    """If the followup correction ITSELF fails (expired token, perms), the original
+    Forbidden must still propagate and the lock must still release."""
+    monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["402620324744790017"]})
+    _sign_disclosure(duel_env)
+    _seed_pending(duel_env, 1)
+    _seed_pending(duel_env, 2)
+    i = _interaction(_member(402620324744790017, role_ids=()))
+    resp = MagicMock()
+    resp.status = 403
+    i.channel.send = AsyncMock(side_effect=discord.Forbidden(resp, "Missing Access"))
+    i.followup = MagicMock()
+    i.followup.send = AsyncMock(side_effect=discord.HTTPException(resp, "also broken"))
+
+    with pytest.raises(discord.Forbidden):
+        await mod._handle_duel(i)
+    assert mod._OPEN_DUELS == {}
