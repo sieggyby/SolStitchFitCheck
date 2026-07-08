@@ -30,6 +30,7 @@ is what makes that safe. The spike stays untouched.
 from __future__ import annotations
 
 import asyncio
+import html as _html
 import json
 import logging
 import re
@@ -203,6 +204,11 @@ def _community_fields(payload_json: str) -> dict | None:
     as_of = p.get("engagement_as_of")
     if isinstance(as_of, str) and as_of.strip():
         fields["engagement_as_of"] = as_of
+    # digits-only tweet id — feeds the DERIVED reveal permalink (_tweet_url). Optional:
+    # a missing/malformed id just means no link at close, never a dropped card.
+    xid = p.get("x_id")
+    if isinstance(xid, str) and xid.isdigit() and len(xid) <= 25:
+        fields["x_id"] = xid
     return fields
 
 
@@ -244,6 +250,27 @@ def _clip(text: str) -> str:
     return text[: _MAX_CARD_CHARS - 1] + "…" if len(text) > _MAX_CARD_CHARS else text
 
 
+def _clip_tweet(text: str) -> str:
+    """Real-tweet render: unescape the HTML entities SocialData leaves in full_text
+    (&amp; etc.) and PRESERVE line structure (a tweet's line breaks are content),
+    normalizing only intra-line whitespace. Same length cap as _clip. AI cards keep
+    the original collapse — this path is community_tweet-only by construction."""
+    text = _html.unescape(str(text))
+    text = "\n".join(" ".join(line.split()) for line in text.splitlines()).strip()
+    return text[: _MAX_CARD_CHARS - 1] + "…" if len(text) > _MAX_CARD_CHARS else text
+
+
+def _tweet_url(card: dict) -> str | None:
+    """The card's x.com permalink, DERIVED from two validated fields (never a raw
+    payload URL): the sanitized author handle + a digits-only x_id. None when either
+    is absent/malformed — the link is a reveal nicety, not load-bearing."""
+    author, xid = card.get("author"), card.get("x_id")
+    if not author or not isinstance(xid, str) or not xid.isdigit() or len(xid) > 25:
+        return None
+    return f"https://x.com/{author}/status/{xid}"
+
+
+
 def _duel_embed(org: str, card_a: dict, card_b: dict, *, votes: int, closed: bool = False,
                 tally: tuple[int, int] | None = None) -> discord.Embed:
     embed = discord.Embed(color=discord.Color.from_str("#C8A86E"))
@@ -253,8 +280,17 @@ def _duel_embed(org: str, card_a: dict, card_b: dict, *, votes: int, closed: boo
     # far under Discord's 256-char field-name cap.
     name_a = f"🅰 · @{card_a['author']}" if card_a.get("author") else f"🅰 · {card_a['kind']}"
     name_b = f"🅱 · @{card_b['author']}" if card_b.get("author") else f"🅱 · {card_b['kind']}"
-    embed.add_field(name=name_a, value=_clip(card_a["text"]) or "—", inline=False)
-    embed.add_field(name=name_b, value=_clip(card_b["text"]) or "—", inline=False)
+
+    def _value(card: dict) -> str:
+        # community cards get the tweet-preserving render (HTML entities unescaped,
+        # line breaks kept); AI cards keep the original whitespace collapse.
+        clip = _clip_tweet if card.get("author") else _clip
+        return clip(card["text"]) or "—"
+
+    # inline=True renders the cards SIDE-BY-SIDE as columns on desktop clients
+    # (mobile stacks inline fields regardless — a Discord client behavior).
+    embed.add_field(name=name_a, value=_value(card_a), inline=True)
+    embed.add_field(name=name_b, value=_value(card_b), inline=True)
     footer = (
         _COMMUNITY_FOOTER
         if card_a.get("author") and card_b.get("author")
@@ -280,6 +316,16 @@ def _duel_embed(org: str, card_a: dict, card_b: dict, *, votes: int, closed: boo
                     else "\nupset — the room picked the other one"
                 )
             embed.add_field(name="reality", value=reality, inline=False)
+            # Tweet permalinks appear ONLY at close — a link visible during the open
+            # vote leaks the answer (one click shows the real counts). URLs are derived
+            # from validated fields, never a raw payload value.
+            url_a, url_b = _tweet_url(card_a), _tweet_url(card_b)
+            if url_a and url_b:
+                embed.add_field(
+                    name="the tweets",
+                    value=f"[🅰 @{card_a['author']}]({url_a}) · [🅱 @{card_b['author']}]({url_b})",
+                    inline=False,
+                )
             as_of = card_a.get("engagement_as_of") or card_b.get("engagement_as_of")
             if as_of:
                 # date only — numbers are as-of-ingest, not a live ticker

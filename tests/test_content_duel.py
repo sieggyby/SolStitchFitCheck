@@ -730,3 +730,53 @@ async def test_ack_correction_failure_never_masks_the_original_error(monkeypatch
     with pytest.raises(discord.Forbidden):
         await mod._handle_duel(i)
     assert mod._OPEN_DUELS == {}
+
+
+# --- render polish: side-by-side, tweet-preserving text, reveal-only links ----
+
+def _cards_from_embed(embed):
+    return {f.name: f for f in embed.fields}
+
+
+async def test_cards_render_side_by_side_and_links_only_at_close(monkeypatch, duel_env):
+    """Cards are inline (desktop columns). The x.com permalink appears ONLY in the
+    closed embed — a link during the open vote leaks the real counts (the answer)."""
+    monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["402620324744790017"]})
+    _sign_disclosure(duel_env)
+    _set_duel_kinds(duel_env, '["community_tweet"]')
+    _seed_pending(duel_env, 1, kind="community_tweet", payload=_ct_payload(author="gabbyvorbeck"))
+    _seed_pending(duel_env, 2, kind="community_tweet", payload=_ct_payload(author="syebastian"))
+    i = _interaction(_member(402620324744790017, role_ids=()))
+    await mod._handle_duel(i)
+    open_embed = i.channel.send.call_args.kwargs["embed"]
+
+    card_fields = [f for f in open_embed.fields if f.name.startswith(("🅰", "🅱"))]
+    assert len(card_fields) == 2 and all(f.inline for f in card_fields)
+    # answer-leak guard: NO tweet link anywhere while the vote is open
+    assert "x.com" not in str(open_embed.to_dict())
+
+    view = i.channel.send.call_args.kwargs["view"]
+    closed = mod._duel_embed("solstitch", view._card_a, view._card_b,
+                             votes=1, closed=True, tally=(1, 0))
+    links = next(f for f in closed.fields if f.name == "the tweets")
+    assert "https://x.com/gabbyvorbeck/status/1938291000000000000" in links.value
+    assert "https://x.com/syebastian/status/1938291000000000000" in links.value
+
+
+def test_tweet_render_unescapes_entities_and_keeps_line_breaks():
+    """Real-tweet cosmetics: SocialData full_text carries HTML entities (&amp;) and
+    meaningful line breaks — both must survive to the card. AI cards keep the original
+    single-line collapse."""
+    community = {"author": "a", "text": "gm &amp; gn\n\nline two   spaced"}
+    ai = {"kind": "tweet", "text": "gm &amp; gn\n\nline two   spaced"}
+    assert mod._clip_tweet(community["text"]) == "gm & gn\n\nline two spaced"
+    assert mod._clip(ai["text"]) == "gm &amp; gn line two spaced"
+
+
+def test_tweet_url_is_derived_and_validated():
+    assert mod._tweet_url({"author": "gabby", "x_id": "123456"}) == \
+        "https://x.com/gabby/status/123456"
+    assert mod._tweet_url({"author": "gabby", "x_id": "12x456"}) is None  # non-digits
+    assert mod._tweet_url({"author": "gabby"}) is None                    # no id
+    assert mod._tweet_url({"x_id": "123456"}) is None                     # no author
+    assert mod._tweet_url({"author": "gabby", "x_id": "1" * 26}) is None  # absurd length
