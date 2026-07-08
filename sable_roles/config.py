@@ -66,6 +66,26 @@ CONTENT_DECK_GUILDS: dict = json.loads(
     os.environ.get("SABLE_ROLES_CONTENT_DECK_GUILDS_JSON", "{}")
 )
 
+# Feature gate for multi-tenant instances (one bot process per client, shared image).
+# Comma list of feature-group names; "all" (the default) enables everything, so the
+# original single-bot SolStitch deployment is byte-identical with the var unset. The
+# TIG duel-only bot sets SABLE_ROLES_ENABLED_FEATURES=duel — a client-server instance
+# must not register event observers (airlock joins, vibe message/reaction watchers)
+# or surface another client's commands in its picker. Group names are the setup_hook
+# blocks: fitcheck (streak + scored-mode + leaderboard + delete-monitor), burn_me,
+# roast, vibe_observer, airlock, state_pin, content_deck, duel. Unknown names are
+# ignored (a typo disables a feature, never widens the set).
+ENABLED_FEATURES: frozenset = frozenset(
+    f.strip().lower()
+    for f in os.environ.get("SABLE_ROLES_ENABLED_FEATURES", "all").split(",")
+    if f.strip()
+)
+
+
+def feature_enabled(name: str) -> bool:
+    """True when the feature group is enabled on this instance ('all' = everything)."""
+    return "all" in ENABLED_FEATURES or name in ENABLED_FEATURES
+
 # --- Burn-me feature config (V2) ---
 
 # Anthropic API key for /burn-me LLM calls. The anthropic SDK auto-reads

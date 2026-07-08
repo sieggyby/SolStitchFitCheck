@@ -17,7 +17,7 @@ from sqlalchemy import text
 
 from sable_platform.db.connection import get_db
 
-from sable_roles.config import GUILD_TO_ORG, SABLE_ROLES_DISCORD_TOKEN
+from sable_roles.config import GUILD_TO_ORG, SABLE_ROLES_DISCORD_TOKEN, feature_enabled
 from sable_roles.features import (
     airlock,
     burn_me,
@@ -49,7 +49,10 @@ class SableRolesClient(discord.Client):
         # A0: airlock requires on_member_join + on_member_remove, which
         # need the Members privileged intent. Must also be ON in the
         # Discord developer portal under Bot → Privileged Gateway Intents.
-        intents.members = True
+        # Feature-gated: a duel-only client instance (airlock off) must NOT
+        # request it — requesting a privileged intent the portal hasn't
+        # enabled fails the whole gateway connection (close 4014).
+        intents.members = feature_enabled("airlock")
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
 
@@ -58,52 +61,58 @@ class SableRolesClient(discord.Client):
         # Order matters: roast + vibe_observer + airlock COMPOSE with
         # whatever event handlers are already bound (wrap-existing-handler
         # pattern), so the @client.event-binding modules must register first.
-        fitcheck_streak.register(self)
-        fitcheck_streak.register_commands(self.tree)
-        burn_me.register_commands(self.tree)
-        roast.register(self)  # R7: 🚩 reaction handler (composes)
-        roast.register_commands(self.tree, client=self)
-        vibe_observer.register(self)  # R10: msg + reaction observation (composes)
-        vibe_observer.start_tasks()    # R10: rollup + GC background loops
-        airlock.register(self)  # A3+A4: on_member_join/remove/invite_* (composes)
-        airlock.register_commands(self.tree, client=self)  # A5+A6: mod commands
-        # Scored Mode V2 Pass A: on_raw_message_delete + on_raw_message_edit
-        # (composes — discord.py dispatches to all registered handlers).
-        delete_monitor.register(self)
-        # Scored Mode V2 Pass B: /scoring slash command. Default state is
-        # `off` per migration 051 default — no scoring fires until a mod
-        # explicitly runs `/scoring action:set state:silent`.
-        scoring_pipeline.register_commands(self.tree, client=self)
-        # Scored Mode V2 Pass C: reveal pipeline. Composes with all
-        # prior reaction / message / delete handlers — MUST register LAST
-        # so the wrap-existing pattern preserves every earlier binding.
-        # No-op until per-guild scoring state is 'revealed' (default 'off').
-        reveal_pipeline.register(self)
-        # Scored Mode V2 Pass D: /leaderboard slash command. Public
-        # (not mod-gated), ephemeral default, 1/user/min rate-limited.
-        # Returns the empty-board message on any guild with zero
-        # revealed fits — so this command ships INVISIBLE in effect
-        # until reveals start landing in #fitcheck.
-        leaderboard.register_commands(self.tree, client=self)
-        # State-pin surface: slash-command-triggered pinned dashboard
-        # in the per-guild #sable-ops channel. Composes on_ready for a
-        # boot-time orphan-pin sweep; no reaction/message handlers.
-        # Default-invisible: when SABLE_ROLES_OPS_CHANNELS_JSON is empty
-        # for a guild, announce_state_change is a no-op + LOW audit.
-        state_pin.register(self)
+        # Every block is gated on ENABLED_FEATURES (default "all" — the
+        # single-bot SolStitch deployment is byte-identical). A multi-tenant
+        # client instance (e.g. the TIG duel-only bot) enables only its
+        # groups, so it neither observes events nor pollutes the command
+        # picker with another client's features. Skipping groups is
+        # compose-safe: each wrapper composes with whatever handlers exist.
+        if feature_enabled("fitcheck"):
+            fitcheck_streak.register(self)
+            fitcheck_streak.register_commands(self.tree)
+        if feature_enabled("burn_me"):
+            burn_me.register_commands(self.tree)
+        if feature_enabled("roast"):
+            roast.register(self)  # R7: 🚩 reaction handler (composes)
+            roast.register_commands(self.tree, client=self)
+        if feature_enabled("vibe_observer"):
+            vibe_observer.register(self)  # R10: msg + reaction observation (composes)
+            vibe_observer.start_tasks()    # R10: rollup + GC background loops
+        if feature_enabled("airlock"):
+            airlock.register(self)  # A3+A4: on_member_join/remove/invite_* (composes)
+            airlock.register_commands(self.tree, client=self)  # A5+A6: mod commands
+        if feature_enabled("fitcheck"):
+            # Scored Mode V2 (Pass A/B/C/D — the fitcheck family):
+            # delete/edit audit, /scoring, reveal pipeline, /leaderboard.
+            # reveal_pipeline composes with all prior reaction / message /
+            # delete handlers — MUST register LAST among the wrappers.
+            # Scoring default state is 'off' per migration 051.
+            delete_monitor.register(self)
+            scoring_pipeline.register_commands(self.tree, client=self)
+            reveal_pipeline.register(self)
+            leaderboard.register_commands(self.tree, client=self)
+        if feature_enabled("state_pin"):
+            # State-pin surface: slash-command-triggered pinned dashboard
+            # in the per-guild #sable-ops channel. Default-invisible when
+            # SABLE_ROLES_OPS_CHANNELS_JSON has no entry for a guild.
+            state_pin.register(self)
         # Content Deck (Phase 0 spike) — registers /content-deck GUILD-SCOPED to TEST
         # guilds only (SABLE_ROLES_CONTENT_DECK_GUILDS_JSON), refusing any live
         # GUILD_TO_ORG guild. Returns the safe test-guild ids to sync below. Empty by
         # default → no registration (invisible). NEVER touches the global tree, so the
         # copy_global_to loop below can never fan it onto a live client guild.
-        content_deck_guilds = content_deck.register_commands(self.tree, client=self)
+        content_deck_guilds = (
+            content_deck.register_commands(self.tree, client=self)
+            if feature_enabled("content_deck") else []
+        )
         # Phase-5 community duel (/duel + /tasteboard) — GLOBAL commands fanned onto
         # the live GUILD_TO_ORG guilds by the copy_global_to loop below (the OPPOSITE
         # registration posture from the Phase-0 content_deck spike above, on purpose).
-        # Authorization is at RUNTIME: org mapping + MOD_ROLES duel trigger + the
+        # Authorization is at RUNTIME: org mapping + the duel-starter allowlist + the
         # FAIL-CLOSED per-org `pairwise_disclosure_signed` gate — an org with no signed
         # disclosure gets a polite refusal, never a duel.
-        content_duel.register_commands(self.tree)
+        if feature_enabled("duel"):
+            content_duel.register_commands(self.tree)
         # Per-guild instant sync via copy_global_to (SableTracking pattern). Each guild's
         # sync is FAILURE-ISOLATED (the long-planned Item-2 hardening, SableTracking
         # bot.py precedent): a Forbidden/HTTP error on ONE guild — e.g. a guild staged
@@ -149,11 +158,13 @@ class SableRolesClient(discord.Client):
         # A3: airlock bootstrap (invite snapshot + team-inviter env seed).
         # Runs on every on_ready (reconnect-safe) — guards against the
         # restart-blackout case where the first joiner after boot would
-        # otherwise be unattributable.
-        try:
-            await airlock.bootstrap(self)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("airlock bootstrap failed: %s", exc)
+        # otherwise be unattributable. Feature-gated: a duel-only instance
+        # has no airlock handlers and no invite-read permissions to use.
+        if feature_enabled("airlock"):
+            try:
+                await airlock.bootstrap(self)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("airlock bootstrap failed: %s", exc)
 
     async def close(self) -> None:
         # Graceful drain. Client.close() is discord.py 2.x's documented shutdown hook.
