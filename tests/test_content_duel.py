@@ -994,3 +994,94 @@ async def test_no_lang_config_serves_whole_pool(monkeypatch, duel_env, db_conn):
     i = _interaction(_member(1, role_ids=()), channel_id=500)
     await mod._handle_duel(i)
     i.channel.send.assert_called_once()  # serves the pair from the whole pool
+
+
+# --- duel rate limits (Arf unlimited; others 1/day/channel) -------------------
+
+def _set_unlimited(conn, user_ids, org="solstitch"):
+    """Set duel_unlimited_starters alongside the disclosure gate."""
+    cfg = {"pairwise_disclosure_signed": "2026-07-09 sieggy — full-reign",
+           "duel_kinds": '["community_tweet"]',
+           "duel_unlimited_starters": json.dumps([str(u) for u in user_ids])}
+    conn.execute("UPDATE orgs SET config_json = ? WHERE org_id = ?", (json.dumps(cfg), org))
+    conn.commit()
+
+
+def _log_duel_open(conn, user_id, channel_id, *, org="solstitch", ts=None):
+    """Simulate a durable content_duel_opened audit row (what the rate limit counts)."""
+    import datetime as _dt
+    ts = ts or _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    conn.execute(
+        "INSERT INTO audit_log (timestamp, actor, action, org_id, detail_json, source) "
+        "VALUES (?, ?, 'content_duel_opened', ?, ?, 'sable-roles')",
+        (ts, f"discord:user:{user_id}", org,
+         json.dumps({"channel_id": str(channel_id), "candidate_a": 1, "candidate_b": 2})),
+    )
+    conn.commit()
+
+
+def _zh_ready(conn):
+    """Disclosure + community_tweet kind + 2 pending cards so a duel can actually post."""
+    _set_duel_kinds(conn, '["community_tweet"]')
+    _seed_pending(conn, 1, kind="community_tweet", payload=_ct_payload(author="a"))
+    _seed_pending(conn, 2, kind="community_tweet", payload=_ct_payload(author="b"))
+
+
+async def test_non_unlimited_starter_capped_one_per_channel_per_day(monkeypatch, duel_env, db_conn):
+    """P0ison-style: one duel per channel per day. A prior open TODAY in this channel
+    (from the durable audit trail) blocks a second."""
+    monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["50"]})
+    _zh_ready(db_conn)  # writes disclosure+kinds, no unlimited list
+    _log_duel_open(db_conn, 50, 500)  # already opened one in channel 500 today
+    i = _interaction(_member(50, role_ids=()), channel_id=500)
+    await mod._handle_duel(i)
+    i.channel.send.assert_not_called()
+    assert "already started a duel in this channel today" in _sent_text(i)
+
+
+async def test_cap_is_per_channel_other_channel_ok(monkeypatch, duel_env, db_conn):
+    """The cap is PER channel — a duel used in channel 500 doesn't block channel 600."""
+    monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["50"]})
+    _zh_ready(db_conn)
+    _log_duel_open(db_conn, 50, 500)  # used channel 500 today
+    i = _interaction(_member(50, role_ids=()), channel_id=600)  # different channel
+    await mod._handle_duel(i)
+    i.channel.send.assert_called_once()  # channel 600 is free
+
+
+async def test_yesterdays_open_does_not_count(monkeypatch, duel_env, db_conn):
+    monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["50"]})
+    _zh_ready(db_conn)
+    _log_duel_open(db_conn, 50, 500, ts="2020-01-01 00:00:00")  # ancient
+    i = _interaction(_member(50, role_ids=()), channel_id=500)
+    await mod._handle_duel(i)
+    i.channel.send.assert_called_once()  # only TODAY's opens count
+
+
+async def test_arf_unlimited_bypasses_the_cap(monkeypatch, duel_env, db_conn):
+    """Arf (on duel_unlimited_starters) can open even after a same-channel open today."""
+    monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["402620324744790017"]})
+    _set_unlimited(db_conn, ["402620324744790017"])
+    _seed_pending(db_conn, 1, kind="community_tweet", payload=_ct_payload(author="a"))
+    _seed_pending(db_conn, 2, kind="community_tweet", payload=_ct_payload(author="b"))
+    _log_duel_open(db_conn, 402620324744790017, 500)  # already one today
+    i = _interaction(_member(402620324744790017, role_ids=()), channel_id=500)
+    await mod._handle_duel(i)
+    i.channel.send.assert_called_once()  # no cap for the unlimited allowlist
+
+
+async def test_open_lock_is_per_channel(monkeypatch, duel_env, db_conn):
+    """A live duel in channel 500 doesn't block a duel in channel 600 (per-channel lock)."""
+    monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["402620324744790017"]})
+    _set_unlimited(db_conn, ["402620324744790017"])  # unlimited so the daily cap is irrelevant
+    _seed_pending(db_conn, 1, kind="community_tweet", payload=_ct_payload(author="a"))
+    _seed_pending(db_conn, 2, kind="community_tweet", payload=_ct_payload(author="b"))
+    import time as _t
+    mod._OPEN_DUELS["500"] = _t.monotonic() + 600  # channel 500 has a live duel
+    i = _interaction(_member(402620324744790017, role_ids=()), channel_id=600)
+    await mod._handle_duel(i)
+    i.channel.send.assert_called_once()  # 600 is free
+    # but the SAME channel with a live duel is refused
+    j = _interaction(_member(402620324744790017, role_ids=()), channel_id=500)
+    await mod._handle_duel(j)
+    assert "already open in this channel" in _sent_text(j)
