@@ -78,6 +78,14 @@ _COMMUNITY_FOOTER = (
 )
 _CONFIG_KEY = "pairwise_disclosure_signed"
 _DUEL_KINDS_KEY = "duel_kinds"
+# Per-channel language routing (mig-free, orgs.config_json). ``duel_channel_lang`` maps
+# {channel_id: lang} (e.g. the Chinese channel → "zh"); ``duel_default_lang`` is the
+# fallback bucket for unmapped channels. Cards are lang-tagged at ingest (payload.lang).
+_CHANNEL_LANG_KEY = "duel_channel_lang"
+_DEFAULT_LANG_KEY = "duel_default_lang"
+# The default/non-CJK bucket — a card is only excluded from it when tagged a non-default
+# language, so untagged cards never silently vanish from the general channel.
+_DEFAULT_LANG = "en"
 # The mig-083 CHECK set — a configured duel_kinds may only name these; anything else
 # is operator error and REFUSES the duel (fail-closed, same posture as the disclosure
 # gate: a typo'd config must never silently widen the pool).
@@ -208,6 +216,38 @@ def _org_duel_kinds(org: str):
     if not all(isinstance(k, str) and k in _VALID_DUEL_KINDS for k in val):
         return _KINDS_REFUSED
     return tuple(val)
+
+
+def _channel_lang(org: str, channel_id: int | str | None) -> str | None:
+    """The language a channel's duels serve, from ``orgs.config_json`` — per-channel
+    ``duel_channel_lang`` ({channel_id: lang}) with a per-org ``duel_default_lang``
+    fallback for unmapped channels. ``None`` = no language routing configured at all
+    (the whole pool, byte-identical pre-lang behavior). FAIL-SAFE: any read/parse error
+    → None (a broken read never mis-routes; it just serves the default whole pool)."""
+    if get_org_config_value is None or channel_id is None:
+        return None
+    try:
+        with get_db() as conn:
+            mapping = get_org_config_value(conn, org, _CHANNEL_LANG_KEY)
+            default = get_org_config_value(conn, org, _DEFAULT_LANG_KEY)
+        if isinstance(mapping, str):
+            try:
+                mapping = json.loads(mapping)
+            except (ValueError, TypeError):
+                mapping = None
+        if isinstance(mapping, dict):
+            hit = mapping.get(str(channel_id))
+            if isinstance(hit, str) and hit.strip():
+                return hit.strip()
+        # unmapped channel: the org default (if any). No config at all → None (whole pool).
+        if isinstance(default, str) and default.strip():
+            return default.strip()
+        # a channel map exists but this channel isn't in it, and no default set →
+        # route to the DEFAULT bucket 'en' so language-specific content stays in its
+        # channel (a zh card never leaks into a general channel once routing is on).
+        return "en" if isinstance(mapping, dict) else None
+    except Exception:  # noqa: BLE001 — a broken read serves the whole pool, never mis-routes
+        return None
 
 
 def _community_fields(payload_json: str) -> dict | None:
@@ -523,21 +563,31 @@ class _DuelView(discord.ui.View):
                 logger.warning("duel close edit failed: %s", exc)
 
 
-def _load_pair(org: str, kinds: tuple[str, ...] | None = None) -> list[dict]:
+def _load_pair(org: str, kinds: tuple[str, ...] | None = None,
+               lang: str | None = None) -> list[dict]:
     """Two fresh pending candidates for a duel (empty/short list when the deck is thin).
     A candidate whose payload doesn't pass the strict public-render whitelist (F1)
     renders "" and is DROPPED — internal payload fields never reach the channel. A
     ``community_tweet`` card additionally carries author + engagement (dropped when
-    either is missing/invalid — see ``_community_fields``); other kinds unchanged."""
+    either is missing/invalid — see ``_community_fields``); other kinds unchanged.
+    ``lang`` routes by the channel's configured language (the default bucket ALSO admits
+    untagged cards so nothing is silently lost)."""
     with get_db() as conn:
-        if kinds is None:
+        if kinds is None and lang is None:
             # MIXED-VERSION SAFETY (audit F1): the unconfigured path stays
             # byte-identical to the pre-duel_kinds call — a stale baked SablePlatform
             # in the Docker image (old signature) can never TypeError this path into
             # "not enough candidates" (the caller's try/except would swallow it).
             rows = cd_db.get_deck_duel_pair(conn, org)
         else:
-            rows = cd_db.get_deck_duel_pair(conn, org, kinds=tuple(kinds))
+            kw: dict = {}
+            if kinds is not None:
+                kw["kinds"] = tuple(kinds)
+            if lang is not None:
+                kw["lang"] = lang
+                # the default bucket admits untagged cards; a specific language does not
+                kw["include_untagged_lang"] = (lang == _DEFAULT_LANG)
+            rows = cd_db.get_deck_duel_pair(conn, org, **kw)
     cards: list[dict] = []
     for r in rows:
         kind = str(r["kind"])
@@ -624,15 +674,23 @@ async def _handle_duel(interaction: discord.Interaction) -> None:
             ephemeral=True, allowed_mentions=_NO_MENTIONS,
         )
         return
+    # Per-channel language routing: the Chinese channel serves zh cards, others the
+    # default bucket. A specific language that can't field 2 cards REFUSES (rather than
+    # silently serving the wrong language) so a thin zh pool never leaks English content.
+    lang = await asyncio.to_thread(_channel_lang, org, interaction.channel_id)
     try:
-        pair = await asyncio.to_thread(_load_pair, org, kinds)
+        pair = await asyncio.to_thread(_load_pair, org, kinds, lang)
     except Exception as exc:  # noqa: BLE001
         logger.warning("duel pair load failed for %s: %s", org, exc)
         pair = []
     if len(pair) < 2:
+        if lang and lang != _DEFAULT_LANG:
+            msg = (f"not enough fresh {lang} content to duel in this channel yet — "
+                   "try the main channel, or check back later.")
+        else:
+            msg = "not enough fresh content to duel right now — try again later."
         await interaction.response.send_message(
-            "not enough fresh content to duel right now — try again later.",
-            ephemeral=True, allowed_mentions=_NO_MENTIONS,
+            msg, ephemeral=True, allowed_mentions=_NO_MENTIONS,
         )
         return
     card_a, card_b = pair[0], pair[1]

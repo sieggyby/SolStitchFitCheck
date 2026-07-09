@@ -84,7 +84,7 @@ def _set_duel_kinds(conn, kinds_value, org="solstitch"):
 
 
 def _ct_payload(*, author="gabbyvorbeck", engagement=None, as_of="2026-07-07T18:00:00Z",
-                text_="real tweet from the community", drop=()):
+                text_="real tweet from the community", lang="en", drop=()):
     """A §1.1-shaped community_tweet payload (internal fields included — they must
     never render). `drop` removes keys to build the invalid variants."""
     p = {
@@ -98,6 +98,7 @@ def _ct_payload(*, author="gabbyvorbeck", engagement=None, as_of="2026-07-07T18:
             {"likes": 120, "retweets": 18, "replies": 22, "quotes": 3, "views": 15400},
         "engagement_as_of": as_of,
         "ingest_batch": "2026-07-07",
+        "lang": lang,
     }
     for key in drop:
         p.pop(key, None)
@@ -115,9 +116,10 @@ def _member(user_id: int, *, role_ids=("555",), is_member=True, manage_guild=Fal
     return member
 
 
-def _interaction(user, *, guild_id=100):
+def _interaction(user, *, guild_id=100, channel_id=500):
     interaction = MagicMock(spec=discord.Interaction)
     interaction.guild_id = guild_id
+    interaction.channel_id = channel_id
     interaction.guild = MagicMock(spec=discord.Guild)
     interaction.user = user
     interaction.response = MagicMock()
@@ -905,3 +907,90 @@ async def test_leaderboard_renders_mentions_not_raw_ids(monkeypatch, duel_env, d
     # community_tweet duels never reach an ops verdict → no "called it" note, no jargon
     footer = i.response.send_message.call_args.kwargs["embed"].footer.text
     assert "top guessers" in footer and "ops" not in footer
+
+
+# --- per-channel language routing (zh channel serves zh cards) ----------------
+
+def _set_lang_cfg(conn, *, channel_map=None, default=None, kinds='["community_tweet"]',
+                  org="solstitch"):
+    """Write the disclosure + duel_kinds + duel_channel_lang/duel_default_lang config."""
+    cfg = {"pairwise_disclosure_signed": "2026-07-08 sieggy — full-reign",
+           "duel_kinds": kinds}
+    if channel_map is not None:
+        cfg["duel_channel_lang"] = json.dumps(channel_map)
+    if default is not None:
+        cfg["duel_default_lang"] = default
+    conn.execute("UPDATE orgs SET config_json = ? WHERE org_id = ?", (json.dumps(cfg), org))
+    conn.commit()
+
+
+def test_channel_lang_reader(duel_env, db_conn):
+    """_channel_lang: no config → None; mapped channel → its lang; unmapped w/ default →
+    default; unmapped w/ a map but no default → 'en'; malformed map → None (fail-safe)."""
+    assert mod._channel_lang("solstitch", 500) is None  # nothing configured
+    _set_lang_cfg(db_conn, channel_map={"777": "zh"})
+    assert mod._channel_lang("solstitch", 777) == "zh"          # mapped
+    assert mod._channel_lang("solstitch", 999) == "en"          # unmapped, map exists → default bucket
+    _set_lang_cfg(db_conn, channel_map={"777": "zh"}, default="es")
+    assert mod._channel_lang("solstitch", 999) == "es"          # unmapped → configured default
+    # malformed map → None (serve whole pool, never mis-route)
+    cfg = {"pairwise_disclosure_signed": "x", "duel_channel_lang": "{not json"}
+    db_conn.execute("UPDATE orgs SET config_json = ? WHERE org_id = 'solstitch'",
+                    (json.dumps(cfg),))
+    db_conn.commit()
+    assert mod._channel_lang("solstitch", 777) is None
+
+
+async def test_duel_in_zh_channel_serves_zh_cards(monkeypatch, duel_env, db_conn):
+    monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["1"]})
+    _set_lang_cfg(db_conn, channel_map={"777": "zh"})
+    # 2 zh + 2 en community_tweet cards, distinct authors
+    _seed_pending(db_conn, 1, kind="community_tweet", payload=_ct_payload(author="zhone", lang="zh"))
+    _seed_pending(db_conn, 2, kind="community_tweet", payload=_ct_payload(author="zhtwo", lang="zh"))
+    _seed_pending(db_conn, 3, kind="community_tweet", payload=_ct_payload(author="enone", lang="en"))
+    _seed_pending(db_conn, 4, kind="community_tweet", payload=_ct_payload(author="entwo", lang="en"))
+    i = _interaction(_member(1, role_ids=()), channel_id=777)
+    await mod._handle_duel(i)
+    i.channel.send.assert_called_once()
+    embed = i.channel.send.call_args.kwargs["embed"]
+    authors = {f.name.split("@")[1] for f in embed.fields if "@" in f.name}
+    assert authors <= {"zhone", "zhtwo"}  # ONLY zh authors, never en
+
+
+async def test_zh_channel_refuses_when_pool_too_thin(monkeypatch, duel_env, db_conn):
+    monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["1"]})
+    _set_lang_cfg(db_conn, channel_map={"777": "zh"})
+    # only ONE zh card + plenty of en — the zh channel must REFUSE, never serve en
+    _seed_pending(db_conn, 1, kind="community_tweet", payload=_ct_payload(author="zhone", lang="zh"))
+    _seed_pending(db_conn, 2, kind="community_tweet", payload=_ct_payload(author="enone", lang="en"))
+    _seed_pending(db_conn, 3, kind="community_tweet", payload=_ct_payload(author="entwo", lang="en"))
+    i = _interaction(_member(1, role_ids=()), channel_id=777)
+    await mod._handle_duel(i)
+    i.channel.send.assert_not_called()  # no duel posted
+    assert "not enough fresh zh content" in _sent_text(i)
+
+
+async def test_unmapped_channel_serves_default_not_zh(monkeypatch, duel_env, db_conn):
+    monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["1"]})
+    _set_lang_cfg(db_conn, channel_map={"777": "zh"})  # 777 is zh; we run in 999
+    _seed_pending(db_conn, 1, kind="community_tweet", payload=_ct_payload(author="zhone", lang="zh"))
+    _seed_pending(db_conn, 2, kind="community_tweet", payload=_ct_payload(author="zhtwo", lang="zh"))
+    _seed_pending(db_conn, 3, kind="community_tweet", payload=_ct_payload(author="enone", lang="en"))
+    _seed_pending(db_conn, 4, kind="community_tweet", payload=_ct_payload(author="entwo", lang="en"))
+    i = _interaction(_member(1, role_ids=()), channel_id=999)  # unmapped → default 'en'
+    await mod._handle_duel(i)
+    i.channel.send.assert_called_once()
+    embed = i.channel.send.call_args.kwargs["embed"]
+    authors = {f.name.split("@")[1] for f in embed.fields if "@" in f.name}
+    assert authors <= {"enone", "entwo"}  # zh cards stay in their channel
+
+
+async def test_no_lang_config_serves_whole_pool(monkeypatch, duel_env, db_conn):
+    """With no duel_channel_lang/default set, routing is off — the whole pool (any lang)."""
+    monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["1"]})
+    _set_duel_kinds(db_conn, '["community_tweet"]')  # disclosure + kinds, NO lang keys
+    _seed_pending(db_conn, 1, kind="community_tweet", payload=_ct_payload(author="zhone", lang="zh"))
+    _seed_pending(db_conn, 2, kind="community_tweet", payload=_ct_payload(author="entwo", lang="en"))
+    i = _interaction(_member(1, role_ids=()), channel_id=500)
+    await mod._handle_duel(i)
+    i.channel.send.assert_called_once()  # serves the pair from the whole pool
