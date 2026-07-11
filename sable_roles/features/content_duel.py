@@ -58,15 +58,18 @@ from sable_roles.features.fitcheck_streak import _is_mod
 logger = logging.getLogger("sable_roles.content_duel")
 
 _NO_MENTIONS = discord.AllowedMentions.none()
-# HARD wall-clock duel length. discord.py View.timeout is an INACTIVITY timeout that
-# refreshes on every button press (Codex F4), so _DuelView also tracks an absolute
-# deadline and shrinks self.timeout to the REMAINING wall-clock after each vote — a
-# steady vote stream can never hold a duel open past the deadline. Kept modest so a
-# bot restart mid-duel (which orphans the message buttons — views are not persistent;
-# clicks after restart show "interaction failed" and the tally never reveals) has a
-# small blast window; the VOTE LEDGER always survives restart (rows are written per
-# click + the durable dedup guard), only the message surface is lost (Codex F3).
-_DUEL_OPEN_SECONDS = 10 * 60
+# HARD wall-clock duel length (24h — a full day so every timezone gets a vote). discord.py
+# View.timeout is an INACTIVITY timeout that refreshes on every button press (Codex F4), so
+# _DuelView also tracks an absolute deadline and shrinks self.timeout to the REMAINING
+# wall-clock after each vote — a steady vote stream can never hold a duel open past the
+# deadline. TRADEOFF at 24h: a bot restart DURING an open duel orphans the message buttons
+# (views are not persistent) — clicks then show "interaction failed" and the auto-reveal
+# never fires. The VOTE LEDGER always survives restart (each click writes its row + the
+# durable dedup guard), so no votes are lost; only the live message surface is. At 24h a
+# restart is far likelier than at the old 10-min length, so: avoid redeploying the bot while
+# a duel is live. Making duels survive restart needs persistent views + a durable close
+# scheduler (deferred; see project_community_duel memory).
+_DUEL_OPEN_SECONDS = 24 * 60 * 60
 _MAX_CARD_CHARS = 900  # embed-safe candidate text clip
 _DISCLOSURE_FOOTER = (
     "community duel · pick the one you like better · your vote is recorded"
