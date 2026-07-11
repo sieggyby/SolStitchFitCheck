@@ -86,6 +86,19 @@ _DEFAULT_LANG_KEY = "duel_default_lang"
 # The default/non-CJK bucket — a card is only excluded from it when tagged a non-default
 # language, so untagged cards never silently vanish from the general channel.
 _DEFAULT_LANG = "en"
+# GENERALIZED per-channel content routing (the superset of duel_channel_lang). One org
+# config key ``duel_channels`` maps {channel_id: profile}; ``duel_default_channel`` is the
+# profile for unmapped channels. A profile is a JSON object, all fields optional:
+#   {"kinds": [...],           # narrow to these candidate kinds (a meme channel → ["meme"])
+#    "lang": "zh",             # narrow to this language bucket (a Chinese channel)
+#    "require_terms": ["prometheus"],  # tweet TEXT must contain one (a Prometheus channel)
+#    "label": "Prometheus"}    # human name for the refusal message
+# So: a meme channel deploys memes, a general channel (empty profile / unmapped default)
+# deploys anything, the Chinese channel posts zh, a Prometheus channel posts Prometheus
+# content. When ``duel_channels`` is UNSET, the bot falls back to the legacy
+# duel_channel_lang path (below) so existing lang-only configs keep working unchanged.
+_CHANNELS_KEY = "duel_channels"
+_DEFAULT_CHANNEL_KEY = "duel_default_channel"
 # The mig-083 CHECK set — a configured duel_kinds may only name these; anything else
 # is operator error and REFUSES the duel (fail-closed, same posture as the disclosure
 # gate: a typo'd config must never silently widen the pool).
@@ -308,6 +321,67 @@ def _channel_lang(org: str, channel_id: int | str | None) -> str | None:
         return "en" if isinstance(mapping, dict) else None
     except Exception:  # noqa: BLE001 — a broken read serves the whole pool, never mis-routes
         return None
+
+
+def _normalize_profile(raw) -> dict:
+    """Coerce a raw channel-profile blob into a validated {kinds?, lang?, require_terms?,
+    label?} dict, dropping any malformed field (routing is UX, not security — an invalid
+    filter serves safe duel-only content, so per-field leniency beats refusing the duel)."""
+    if not isinstance(raw, dict):
+        return {}
+    prof: dict = {}
+    kinds = raw.get("kinds")
+    if isinstance(kinds, list):
+        valid = tuple(k for k in kinds if isinstance(k, str) and k in _VALID_DUEL_KINDS)
+        if valid:
+            prof["kinds"] = valid
+    lang = raw.get("lang")
+    if isinstance(lang, str) and lang.strip():
+        prof["lang"] = lang.strip()
+    terms = raw.get("require_terms")
+    if isinstance(terms, list):
+        valid = tuple(t.strip() for t in terms if isinstance(t, str) and t.strip())[:10]
+        if valid:
+            prof["require_terms"] = valid
+    label = raw.get("label")
+    if isinstance(label, str) and label.strip():
+        prof["label"] = label.strip()[:40]
+    return prof
+
+
+def _channel_profile(org: str, channel_id: int | str | None) -> dict:
+    """The per-channel content profile — the GENERALIZED routing (a meme channel deploys
+    memes, the Chinese channel posts zh, a Prometheus channel posts Prometheus content, a
+    general channel deploys anything). Reads ``duel_channels`` {channel_id: profile} with
+    ``duel_default_channel`` for unmapped channels. When ``duel_channels`` is UNSET, falls
+    back to the legacy ``duel_channel_lang`` path so lang-only configs keep working.
+    FAIL-SAFE: any read/parse error → {} (the whole pool — never mis-routes)."""
+    if get_org_config_value is None or channel_id is None:
+        return {}
+    try:
+        with get_db() as conn:
+            channels = get_org_config_value(conn, org, _CHANNELS_KEY)
+            default_ch = get_org_config_value(conn, org, _DEFAULT_CHANNEL_KEY)
+    except Exception:  # noqa: BLE001 — a broken read serves the whole pool, never mis-routes
+        return {}
+    if isinstance(channels, str):
+        try:
+            channels = json.loads(channels)
+        except (ValueError, TypeError):
+            channels = None
+    if isinstance(channels, dict):
+        raw = channels.get(str(channel_id))
+        if raw is None:  # unmapped channel → the org's default profile (if any)
+            if isinstance(default_ch, str):
+                try:
+                    default_ch = json.loads(default_ch)
+                except (ValueError, TypeError):
+                    default_ch = None
+            raw = default_ch
+        return _normalize_profile(raw)
+    # legacy: no duel_channels config → the old lang-only routing, byte-identical.
+    lang = _channel_lang(org, channel_id)
+    return {"lang": lang} if lang else {}
 
 
 def _community_fields(payload_json: str) -> dict | None:
@@ -626,18 +700,19 @@ class _DuelView(discord.ui.View):
 
 
 def _load_pair(org: str, kinds: tuple[str, ...] | None = None,
-               lang: str | None = None) -> list[dict]:
+               lang: str | None = None,
+               require_terms: tuple[str, ...] | None = None) -> list[dict]:
     """Two fresh pending candidates for a duel (empty/short list when the deck is thin).
     A candidate whose payload doesn't pass the strict public-render whitelist (F1)
     renders "" and is DROPPED — internal payload fields never reach the channel. A
     ``community_tweet`` card additionally carries author + engagement (dropped when
     either is missing/invalid — see ``_community_fields``); other kinds unchanged.
-    ``lang`` routes by the channel's configured language (the default bucket ALSO admits
-    untagged cards so nothing is silently lost)."""
+    ``kinds``/``lang``/``require_terms`` are the per-channel content-profile filters (the
+    default lang bucket ALSO admits untagged cards so nothing is silently lost)."""
     with get_db() as conn:
-        if kinds is None and lang is None:
+        if kinds is None and lang is None and require_terms is None:
             # MIXED-VERSION SAFETY (audit F1): the unconfigured path stays
-            # byte-identical to the pre-duel_kinds call — a stale baked SablePlatform
+            # byte-identical to the pre-filter call — a stale baked SablePlatform
             # in the Docker image (old signature) can never TypeError this path into
             # "not enough candidates" (the caller's try/except would swallow it).
             rows = cd_db.get_deck_duel_pair(conn, org)
@@ -649,6 +724,8 @@ def _load_pair(org: str, kinds: tuple[str, ...] | None = None,
                 kw["lang"] = lang
                 # the default bucket admits untagged cards; a specific language does not
                 kw["include_untagged_lang"] = (lang == _DEFAULT_LANG)
+            if require_terms is not None:
+                kw["require_terms"] = tuple(require_terms)
             rows = cd_db.get_deck_duel_pair(conn, org, **kw)
     cards: list[dict] = []
     for r in rows:
@@ -751,18 +828,24 @@ async def _handle_duel(interaction: discord.Interaction) -> None:
             ephemeral=True, allowed_mentions=_NO_MENTIONS,
         )
         return
-    # Per-channel language routing: the Chinese channel serves zh cards, others the
-    # default bucket. A specific language that can't field 2 cards REFUSES (rather than
-    # silently serving the wrong language) so a thin zh pool never leaks English content.
-    lang = await asyncio.to_thread(_channel_lang, org, interaction.channel_id)
+    # Per-channel content routing (duel_channels profile): a meme channel serves memes,
+    # the Chinese channel serves zh, a Prometheus channel serves Prometheus tweets, a
+    # general channel serves anything. A profile that can't field 2 cards REFUSES (rather
+    # than silently serving the wrong content) so a thin/topic pool never leaks off-topic.
+    profile = await asyncio.to_thread(_channel_profile, org, interaction.channel_id)
+    eff_kinds = profile.get("kinds") or kinds  # channel narrows the org's duel_kinds
+    lang = profile.get("lang")
+    terms = profile.get("require_terms")
     try:
-        pair = await asyncio.to_thread(_load_pair, org, kinds, lang)
+        pair = await asyncio.to_thread(_load_pair, org, eff_kinds, lang, terms)
     except Exception as exc:  # noqa: BLE001
         logger.warning("duel pair load failed for %s: %s", org, exc)
         pair = []
     if len(pair) < 2:
-        if lang and lang != _DEFAULT_LANG:
-            msg = (f"not enough fresh {lang} content to duel in this channel yet — "
+        # name the constraint in the refusal so it's clear WHY (label > lang > generic).
+        label = profile.get("label") or (lang if lang and lang != _DEFAULT_LANG else None)
+        if label:
+            msg = (f"not enough fresh {label} content to duel in this channel yet — "
                    "try the main channel, or check back later.")
         else:
             msg = "not enough fresh content to duel right now — try again later."

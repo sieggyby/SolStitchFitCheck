@@ -1085,3 +1085,88 @@ async def test_open_lock_is_per_channel(monkeypatch, duel_env, db_conn):
     j = _interaction(_member(402620324744790017, role_ids=()), channel_id=500)
     await mod._handle_duel(j)
     assert "already open in this channel" in _sent_text(j)
+
+
+# --- generalized per-channel content profiles (duel_channels) -----------------
+
+def _set_channels(conn, channels, *, default=None, kinds='["community_tweet"]', org="solstitch"):
+    cfg = {"pairwise_disclosure_signed": "2026-07-11 sieggy — full-reign",
+           "duel_kinds": kinds,
+           "duel_channels": json.dumps(channels)}
+    if default is not None:
+        cfg["duel_default_channel"] = json.dumps(default)
+    conn.execute("UPDATE orgs SET config_json = ? WHERE org_id = ?", (json.dumps(cfg), org))
+    conn.commit()
+
+
+def test_channel_profile_resolution(duel_env, db_conn):
+    """duel_channels resolves per-channel profiles; unmapped → default; malformed dropped;
+    no duel_channels → legacy duel_channel_lang fallback."""
+    _set_channels(db_conn, {
+        "700": {"require_terms": ["prometheus"], "label": "Prometheus"},
+        "701": {"kinds": ["meme"], "label": "memes"},
+        "702": {},                       # general — anything
+        "703": {"kinds": ["nonsense"], "require_terms": ["x"]},  # bad kind dropped, term kept
+    }, default={"lang": "en"})
+    assert mod._channel_profile("solstitch", 700) == {"require_terms": ("prometheus",), "label": "Prometheus"}
+    assert mod._channel_profile("solstitch", 701) == {"kinds": ("meme",), "label": "memes"}
+    assert mod._channel_profile("solstitch", 702) == {}                 # general
+    assert mod._channel_profile("solstitch", 703) == {"require_terms": ("x",)}  # bad kind pruned
+    assert mod._channel_profile("solstitch", 999) == {"lang": "en"}     # unmapped → default
+
+    # no duel_channels at all → legacy lang path
+    _set_lang_cfg(db_conn, channel_map={"800": "zh"})
+    assert mod._channel_profile("solstitch", 800) == {"lang": "zh"}
+
+
+async def test_prometheus_channel_serves_only_prometheus(monkeypatch, duel_env, db_conn):
+    monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["1"]})
+    _set_unlimited(db_conn, [1])  # skip the daily cap for the test
+    # re-apply channels config (the _set_unlimited call above overwrote config_json)
+    cfg = json.loads(db_conn.execute("SELECT config_json FROM orgs WHERE org_id='solstitch'").fetchone()[0])
+    cfg["duel_channels"] = json.dumps({"700": {"require_terms": ["prometheus"], "label": "Prometheus"}})
+    db_conn.execute("UPDATE orgs SET config_json=? WHERE org_id='solstitch'", (json.dumps(cfg),))
+    db_conn.commit()
+    _seed_pending(db_conn, 1, kind="community_tweet",
+                  payload=_ct_payload(author="pa", text_="the Prometheus swarm beta popped off"))
+    _seed_pending(db_conn, 2, kind="community_tweet",
+                  payload=_ct_payload(author="pb", text_="Prometheus public release soon"))
+    _seed_pending(db_conn, 3, kind="community_tweet",
+                  payload=_ct_payload(author="oa", text_="just bought more $tig"))
+    i = _interaction(_member(1, role_ids=()), channel_id=700)
+    await mod._handle_duel(i)
+    i.channel.send.assert_called_once()
+    authors = {f.name.split("@")[1] for f in i.channel.send.call_args.kwargs["embed"].fields if "@" in f.name}
+    assert authors <= {"pa", "pb"}  # never the off-topic card
+
+
+async def test_topic_channel_refuses_with_label_when_thin(monkeypatch, duel_env, db_conn):
+    monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["1"]})
+    _set_unlimited(db_conn, [1])
+    cfg = json.loads(db_conn.execute("SELECT config_json FROM orgs WHERE org_id='solstitch'").fetchone()[0])
+    cfg["duel_channels"] = json.dumps({"700": {"require_terms": ["prometheus"], "label": "Prometheus"}})
+    db_conn.execute("UPDATE orgs SET config_json=? WHERE org_id='solstitch'", (json.dumps(cfg),))
+    db_conn.commit()
+    _seed_pending(db_conn, 1, kind="community_tweet",
+                  payload=_ct_payload(author="pa", text_="Prometheus beta"))  # only ONE match
+    _seed_pending(db_conn, 2, kind="community_tweet", payload=_ct_payload(author="oa", text_="gm $tig"))
+    i = _interaction(_member(1, role_ids=()), channel_id=700)
+    await mod._handle_duel(i)
+    i.channel.send.assert_not_called()
+    assert "not enough fresh Prometheus content" in _sent_text(i)
+
+
+async def test_general_channel_empty_profile_serves_anything(monkeypatch, duel_env, db_conn):
+    monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["1"]})
+    _set_channels(db_conn, {"702": {}}, default={"require_terms": ["prometheus"]})
+    _set_unlimited(db_conn, [1])
+    cfg = json.loads(db_conn.execute("SELECT config_json FROM orgs WHERE org_id='solstitch'").fetchone()[0])
+    cfg["duel_channels"] = json.dumps({"702": {}})
+    cfg["duel_kinds"] = '["community_tweet"]'
+    db_conn.execute("UPDATE orgs SET config_json=? WHERE org_id='solstitch'", (json.dumps(cfg),))
+    db_conn.commit()
+    _seed_pending(db_conn, 1, kind="community_tweet", payload=_ct_payload(author="a", text_="gm $tig"))
+    _seed_pending(db_conn, 2, kind="community_tweet", payload=_ct_payload(author="b", text_="wagmi $tig"))
+    i = _interaction(_member(1, role_ids=()), channel_id=702)  # general — no topic filter
+    await mod._handle_duel(i)
+    i.channel.send.assert_called_once()  # off-topic cards are fine in general
