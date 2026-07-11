@@ -113,6 +113,11 @@ class SableRolesClient(discord.Client):
         # disclosure gets a polite refusal, never a duel.
         if feature_enabled("duel"):
             content_duel.register_commands(self.tree)
+            # Persistent duel view + durable close sweep (mig 084): a 24h duel survives a
+            # restart — the persistent view re-binds button clicks by message_id and the
+            # sweep reveals past-deadline duels (incl. a startup pass for ones that expired
+            # while the bot was down). Drained in close().
+            content_duel.register(self)
         # Per-guild instant sync via copy_global_to (SableTracking pattern). Each guild's
         # sync is FAILURE-ISOLATED (the long-planned Item-2 hardening, SableTracking
         # bot.py precedent): a Forbidden/HTTP error on ONE guild — e.g. a guild staged
@@ -169,6 +174,8 @@ class SableRolesClient(discord.Client):
     async def close(self) -> None:
         # Graceful drain. Client.close() is discord.py 2.x's documented shutdown hook.
         vibe_observer.stop_tasks()
+        if feature_enabled("duel"):
+            content_duel.stop_tasks()
         await fitcheck_streak.close()
         await reveal_pipeline.close()
         await state_pin.close()

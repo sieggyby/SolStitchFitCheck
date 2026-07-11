@@ -49,7 +49,14 @@ def duel_env(monkeypatch, db_conn):
     monkeypatch.setattr(mod, "asyncio", SimpleNamespace(to_thread=_inline_to_thread))
     # module-level state: cleared, never rebound (repo convention).
     mod._OPEN_DUELS.clear()
+    mod._VOTING.clear()
     return db_conn
+
+
+def _served_cards(db_conn, message_id):
+    """The two rendered-card snapshots the duel was posted with, from the mig-084 row."""
+    duel = mod.cduels.get_duel(db_conn, str(message_id))
+    return json.loads(duel["card_a_json"]), json.loads(duel["card_b_json"])
 
 
 def _sign_disclosure(conn, org="solstitch"):
@@ -116,6 +123,9 @@ def _member(user_id: int, *, role_ids=("555",), is_member=True, manage_guild=Fal
     return member
 
 
+_NEXT_MSG_ID = [9000]
+
+
 def _interaction(user, *, guild_id=100, channel_id=500):
     interaction = MagicMock(spec=discord.Interaction)
     interaction.guild_id = guild_id
@@ -126,8 +136,45 @@ def _interaction(user, *, guild_id=100, channel_id=500):
     interaction.response.send_message = AsyncMock()
     interaction.response.edit_message = AsyncMock()
     interaction.channel = MagicMock(spec=discord.TextChannel)
-    interaction.channel.send = AsyncMock(return_value=MagicMock(spec=discord.Message))
+    # channel.send returns a message with a REAL id so _handle_duel's durable content_duels
+    # insert (keyed by str(message.id)) is deterministic and votes can look it up.
+    sent = MagicMock(spec=discord.Message)
+    _NEXT_MSG_ID[0] += 1
+    sent.id = _NEXT_MSG_ID[0]
+    interaction.channel.send = AsyncMock(return_value=sent)
     return interaction
+
+
+def _vote_interaction(user, message_id):
+    """A button-click interaction on a specific duel message (the persistent view keys on
+    interaction.message.id)."""
+    vi = _interaction(user)
+    vi.message = MagicMock(spec=discord.Message)
+    vi.message.id = int(message_id)
+    return vi
+
+
+async def _cast(db_conn, user, choice, message_id):
+    """Simulate a button click via the stateless persistent view."""
+    vi = _vote_interaction(user, message_id)
+    await mod._DuelView()._vote(vi, choice)
+    return vi
+
+
+async def _close(db_conn, client, message_id):
+    """Run the durable close on one duel (as the sweep would)."""
+    duel = mod.cduels.get_duel(db_conn, str(message_id))
+    await mod._close_one(client, duel)
+
+
+def _fake_client(edited_msg):
+    """A client whose channel.fetch_message returns edited_msg (for the reveal edit)."""
+    client = MagicMock()
+    channel = MagicMock()
+    channel.fetch_message = AsyncMock(return_value=edited_msg)
+    client.get_channel = MagicMock(return_value=channel)
+    client.fetch_channel = AsyncMock(return_value=channel)
+    return client
 
 
 def _sent_kwargs(interaction):
@@ -249,20 +296,19 @@ async def test_duel_posts_public_embed_with_disclosure(duel_env):
 
 
 async def _open_duel(duel_env):
+    """Post a duel and return its durable message_id (the content_duels row now exists)."""
     _sign_disclosure(duel_env)
     _seed_pending(duel_env, 1)
     _seed_pending(duel_env, 2)
     i = _interaction(_member(1))
     await mod._handle_duel(i)
-    return i.channel.send.call_args.kwargs["view"]
+    return str(i.channel.send.return_value.id)
 
 
 async def test_two_members_vote_two_rows(duel_env):
-    view = await _open_duel(duel_env)
-    v1 = _interaction(_member(10, role_ids=()))  # NOT mods — voting is open
-    v2 = _interaction(_member(11, role_ids=()))
-    await view._vote(v1, "a")
-    await view._vote(v2, "b")
+    mid = await _open_duel(duel_env)
+    await _cast(duel_env, _member(10, role_ids=()), "a", mid)  # NOT mods — voting is open
+    await _cast(duel_env, _member(11, role_ids=()), "b", mid)
     rows = duel_env.execute(
         "SELECT actor, actor_kind, decision, surface, candidate_id, pair_loser_id "
         "FROM content_deck_decisions ORDER BY id"
@@ -271,65 +317,62 @@ async def test_two_members_vote_two_rows(duel_env):
     assert rows[0][0] == "discord:user:10" and rows[0][1] == "community"
     assert rows[0][2] == "keep" and rows[0][3] == "discord"
     winner_a, loser_a = rows[0][4], rows[0][5]
-    winner_b, loser_b = rows[1][4], rows[1][5]
+    winner_b = rows[1][4]
     assert {winner_a, loser_a} == {1, 2} and winner_a != winner_b  # opposite picks
 
 
 async def test_same_member_votes_once(duel_env):
-    view = await _open_duel(duel_env)
-    v = _interaction(_member(10, role_ids=()))
-    await view._vote(v, "a")
-    v2 = _interaction(_member(10, role_ids=()))
-    await view._vote(v2, "b")
+    mid = await _open_duel(duel_env)
+    await _cast(duel_env, _member(10, role_ids=()), "a", mid)
+    v2 = await _cast(duel_env, _member(10, role_ids=()), "b", mid)
     n = duel_env.execute("SELECT COUNT(*) FROM content_deck_decisions").fetchone()[0]
     assert n == 1
     assert "already voted" in _sent_text(v2)
 
 
 async def test_durable_dedup_survives_restart(duel_env):
-    """The in-View dict dies on restart — the DB guard must still refuse a re-vote."""
-    view = await _open_duel(duel_env)
-    v = _interaction(_member(10, role_ids=()))
-    await view._vote(v, "a")
-    view._votes.clear()  # simulate a bot restart mid-duel
-    v2 = _interaction(_member(10, role_ids=()))
-    await view._vote(v2, "b")
+    """The stateless persistent view has NO in-memory vote state — the durable DB guard is
+    the only dedup, so a re-vote after a 'restart' (fresh view instance) still refuses."""
+    mid = await _open_duel(duel_env)
+    await _cast(duel_env, _member(10, role_ids=()), "a", mid)
+    # a fresh _DuelView() (what a restart yields) has no memory of the prior vote
+    v2 = await _cast(duel_env, _member(10, role_ids=()), "b", mid)
     n = duel_env.execute("SELECT COUNT(*) FROM content_deck_decisions").fetchone()[0]
     assert n == 1
     assert "already voted" in _sent_text(v2)
 
 
 async def test_failed_write_never_counts_the_vote(monkeypatch, duel_env):
-    view = await _open_duel(duel_env)
+    mid = await _open_duel(duel_env)
     monkeypatch.setattr(mod.cd_db, "record_deck_decision",
                         MagicMock(side_effect=RuntimeError("boom")))
-    v = _interaction(_member(10, role_ids=()))
-    await view._vote(v, "a")
+    v = await _cast(duel_env, _member(10, role_ids=()), "a", mid)
     assert "couldn't record" in _sent_text(v)
-    assert 10 not in view._votes  # the member can retry
+    assert duel_env.execute("SELECT COUNT(*) FROM content_deck_decisions").fetchone()[0] == 0
 
 
 async def test_open_tally_is_blind_and_close_reveals(duel_env):
-    view = await _open_duel(duel_env)
-    v = _interaction(_member(10, role_ids=()))
-    await view._vote(v, "a")
+    mid = await _open_duel(duel_env)
+    v = await _cast(duel_env, _member(10, role_ids=()), "a", mid)
     open_embed = v.response.edit_message.call_args.kwargs["embed"]
     open_text = " ".join(f"{f.name} {f.value}" for f in open_embed.fields)
     assert "votes 1" in open_text and "🅰 1" not in open_text  # count only, no split
 
-    msg = MagicMock(spec=discord.Message)
-    msg.edit = AsyncMock()
-    view.bind_message(msg)
-    await view.on_timeout()
-    closed_embed = msg.edit.call_args.kwargs["embed"]
+    edited = MagicMock(spec=discord.Message)
+    edited.edit = AsyncMock()
+    await _close(duel_env, _fake_client(edited), mid)
+    closed_embed = edited.edit.call_args.kwargs["embed"]
     closed_text = " ".join(f"{f.name} {f.value}" for f in closed_embed.fields)
     assert "🅰 1 — 0 🅱" in closed_text and "🅰 wins" in closed_text
+    view = edited.edit.call_args.kwargs["view"]
     assert all(child.disabled for child in view.children)
+    # the duel row is now closed
+    assert mod.cduels.get_duel(duel_env, mid)["status"] == "closed"
 
 
 async def test_second_duel_refused_while_one_is_open(duel_env):
-    """Codex F2: a mod double-post (before any vote lands — invisible to the SP 12h
-    exclusion) is refused by the per-org open-duel lock."""
+    """A mod double-post (before any vote lands) is refused by the DURABLE per-channel lock
+    (the content_duels open row)."""
     await _open_duel(duel_env)
     _seed_pending(duel_env, 3)
     _seed_pending(duel_env, 4)
@@ -338,14 +381,26 @@ async def test_second_duel_refused_while_one_is_open(duel_env):
     assert "already open" in _sent_text(i)
 
 
+async def test_close_is_single_flight(duel_env):
+    """Two sweeps hitting the same duel reveal it ONCE (the DB close claim is single-flight)."""
+    mid = await _open_duel(duel_env)
+    e1 = MagicMock(spec=discord.Message); e1.edit = AsyncMock()
+    e2 = MagicMock(spec=discord.Message); e2.edit = AsyncMock()
+    duel = mod.cduels.get_duel(duel_env, mid)
+    await mod._close_one(_fake_client(e1), duel)
+    await mod._close_one(_fake_client(e2), duel)  # second claim loses
+    assert e1.edit.called and not e2.edit.called
+
+
 async def test_vote_after_deadline_refused(duel_env):
-    """Codex F4: the HARD wall-clock deadline — a vote past it is refused even if the
-    inactivity timer hasn't fired yet, and writes nothing."""
-    view = await _open_duel(duel_env)
-    view._deadline = 0.0  # force past-deadline
-    v = _interaction(_member(10, role_ids=()))
-    await view._vote(v, "a")
-    assert "closed" in _sent_text(v)
+    """A vote past the hard deadline (row still 'open', sweep not yet run) is refused and
+    writes nothing."""
+    mid = await _open_duel(duel_env)
+    duel_env.execute("UPDATE content_duels SET deadline='2000-01-01T00:00:00Z' WHERE message_id=?",
+                     (mid,))
+    duel_env.commit()
+    v = await _cast(duel_env, _member(10, role_ids=()), "a", mid)
+    assert "ended" in _sent_text(v)
     assert duel_env.execute("SELECT COUNT(*) FROM content_deck_decisions").fetchone()[0] == 0
 
 
@@ -384,10 +439,9 @@ async def test_missing_accessor_fails_gate_closed_not_boot(monkeypatch, duel_env
 
 async def test_rapid_double_click_yields_one_row(monkeypatch, duel_env):
     """Adversarial T2-1: discord.py dispatches each click as its OWN task — two rapid
-    clicks must still land exactly one row (the synchronous pre-mark closes the race
-    the durable guard can't see mid-transaction)."""
-    view = await _open_duel(duel_env)
-
+    clicks by one member must still land exactly one row. The stateless view's
+    (message,user) _VOTING guard closes the race the durable guard can't see mid-write."""
+    mid = await _open_duel(duel_env)
     real_sleep = asyncio.sleep
 
     async def _yielding_to_thread(fn, *a, **k):
@@ -395,22 +449,22 @@ async def test_rapid_double_click_yields_one_row(monkeypatch, duel_env):
         return fn(*a, **k)
 
     monkeypatch.setattr(mod, "asyncio", SimpleNamespace(to_thread=_yielding_to_thread))
-    v1 = _interaction(_member(10, role_ids=()))
-    v2 = _interaction(_member(10, role_ids=()))  # same member, opposite button
+    v1 = _vote_interaction(_member(10, role_ids=()), mid)
+    v2 = _vote_interaction(_member(10, role_ids=()), mid)  # same member+message, opposite button
+    view = mod._DuelView()
     await asyncio.gather(view._vote(v1, "a"), view._vote(v2, "b"))
     n = duel_env.execute("SELECT COUNT(*) FROM content_deck_decisions").fetchone()[0]
     assert n == 1
-    assert view._vote_count() == 1
 
 
 async def test_failed_write_rolls_back_the_premark(monkeypatch, duel_env):
-    """The T2-1 pre-mark must not lock a member out after a transient write failure."""
-    view = await _open_duel(duel_env)
+    """A transient write failure must not lock a member out — the _VOTING guard is released
+    in finally, so a retry can proceed."""
+    mid = await _open_duel(duel_env)
     monkeypatch.setattr(mod.cd_db, "record_deck_decision",
                         MagicMock(side_effect=RuntimeError("boom")))
-    v = _interaction(_member(10, role_ids=()))
-    await view._vote(v, "a")
-    assert 10 not in view._votes  # rolled back — retry possible
+    await _cast(duel_env, _member(10, role_ids=()), "a", mid)
+    assert (mid, 10) not in mod._VOTING  # released — retry possible
     monkeypatch.undo()
 
 
@@ -427,9 +481,8 @@ async def test_tasteboard_gated_and_renders(duel_env):
     await mod._handle_tasteboard(i2)
     assert "no duel votes yet" in _sent_text(i2)
 
-    view = await _open_duel(duel_env)
-    v = _interaction(_member(10, role_ids=()))
-    await view._vote(v, "a")
+    mid = await _open_duel(duel_env)
+    await _cast(duel_env, _member(10, role_ids=()), "a", mid)
     i3 = _interaction(_member(11, role_ids=()))
     i3.guild.get_member = MagicMock(return_value=None)
     await mod._handle_tasteboard(i3)
@@ -464,9 +517,9 @@ async def test_duel_kinds_community_only_never_pairs_ai(duel_env):
                   payload='{"template_id":"drake","format":"Drake","captions":{"a":"x","b":"y"}}')
     i = _interaction(_member(1))
     await mod._handle_duel(i)
-    view = i.channel.send.call_args.kwargs["view"]
-    assert {view._card_a["id"], view._card_b["id"]} == {1, 2}
-    assert view._card_a["kind"] == view._card_b["kind"] == "community_tweet"
+    ca, cb = _served_cards(duel_env, i.channel.send.return_value.id)
+    assert {ca["id"], cb["id"]} == {1, 2}
+    assert ca["kind"] == cb["kind"] == "community_tweet"
 
 
 async def test_json_string_encoded_duel_kinds_accepted(duel_env):
@@ -478,8 +531,8 @@ async def test_json_string_encoded_duel_kinds_accepted(duel_env):
     _seed_pending(duel_env, 3, kind="tweet")
     i = _interaction(_member(1))
     await mod._handle_duel(i)
-    view = i.channel.send.call_args.kwargs["view"]
-    assert {view._card_a["id"], view._card_b["id"]} == {1, 2}
+    ca, cb = _served_cards(duel_env, i.channel.send.return_value.id)
+    assert {ca["id"], cb["id"]} == {1, 2}
 
 
 async def test_explicit_empty_duel_kinds_refuses(duel_env):
@@ -544,8 +597,8 @@ async def test_no_config_org_calls_pair_accessor_without_kinds_kwarg(monkeypatch
 # --- community card render + reveal ----------------------------------------------
 
 async def _open_community_duel(duel_env, *, hi_engagement=None, lo_engagement=None):
-    """Two community cards (id 1 = high engagement, id 2 = low), duel opened.
-    Returns (view, posted_kwargs)."""
+    """Two community cards (id 1 = high engagement, id 2 = low), duel opened. Returns
+    (message_id, posted_kwargs)."""
     _set_duel_kinds(duel_env, ["community_tweet"])
     hi = hi_engagement or {"likes": 120, "retweets": 18, "replies": 22, "quotes": 3, "views": 15400}
     lo = lo_engagement or {"likes": 10, "retweets": 2, "replies": 5, "quotes": 0, "views": 900}
@@ -555,12 +608,19 @@ async def _open_community_duel(duel_env, *, hi_engagement=None, lo_engagement=No
                   payload=_ct_payload(author="syebastian", engagement=lo))
     i = _interaction(_member(1))
     await mod._handle_duel(i)
-    kwargs = i.channel.send.call_args.kwargs
-    return kwargs["view"], kwargs
+    return str(i.channel.send.return_value.id), i.channel.send.call_args.kwargs
+
+
+async def _closed_embed(duel_env, mid):
+    """Run the durable close and return the revealed embed."""
+    edited = MagicMock(spec=discord.Message)
+    edited.edit = AsyncMock()
+    await _close(duel_env, _fake_client(edited), mid)
+    return edited.edit.call_args.kwargs["embed"]
 
 
 async def test_community_cards_render_author_and_variant_footer(duel_env):
-    view, kwargs = await _open_community_duel(duel_env)
+    mid, kwargs = await _open_community_duel(duel_env)
     embed = kwargs["embed"]
     f_a, f_b = embed.fields[0], embed.fields[1]
     assert f_a.name.startswith("🅰 · @") and f_b.name.startswith("🅱 · @")
@@ -570,8 +630,7 @@ async def test_community_cards_render_author_and_variant_footer(duel_env):
     # the open tally stays BLIND: count only — no split, no reality, no numbers
     assert embed.fields[2].name == "votes" and embed.fields[2].value == "0"
     assert all(f.name != "reality" for f in embed.fields)
-    v = _interaction(_member(10, role_ids=()))
-    await view._vote(v, "a")
+    v = await _cast(duel_env, _member(10, role_ids=()), "a", mid)
     open_embed = v.response.edit_message.call_args.kwargs["embed"]
     open_text = " ".join(f"{f.name} {f.value}" for f in open_embed.fields)
     assert "votes 1" in open_text
@@ -581,15 +640,11 @@ async def test_community_cards_render_author_and_variant_footer(duel_env):
 async def test_close_reveals_weighted_reality_and_room_verdict(duel_env):
     """The reveal: WEIGHTED score (likes + 2·RT + replies + quotes), the popped
     verdict, the room-vs-reality line, and the as-of date in the closed footer."""
-    view, _ = await _open_community_duel(duel_env)
-    hi_is_a = view._card_a["id"] == 1  # RANDOM() pair order — resolve which side is which
-    v = _interaction(_member(10, role_ids=()))
-    await view._vote(v, "a" if hi_is_a else "b")  # the room picks the popped card
-    msg = MagicMock(spec=discord.Message)
-    msg.edit = AsyncMock()
-    view.bind_message(msg)
-    await view.on_timeout()
-    closed_embed = msg.edit.call_args.kwargs["embed"]
+    mid, _ = await _open_community_duel(duel_env)
+    ca, _cb = _served_cards(duel_env, mid)
+    hi_is_a = ca["id"] == 1  # RANDOM() pair order — resolve which side is which
+    await _cast(duel_env, _member(10, role_ids=()), "a" if hi_is_a else "b", mid)
+    closed_embed = await _closed_embed(duel_env, mid)
     reality = next(f for f in closed_embed.fields if f.name == "reality").value
     if hi_is_a:  # hi: 120 + 2*18 + 22 + 3 = 181 · lo: 10 + 2*2 + 5 + 0 = 19
         assert reality.startswith("🅰 score 181 (120❤ 18🔁 22💬 3❞) · 🅱 score 19 — 🅰 popped")
@@ -601,16 +656,12 @@ async def test_close_reveals_weighted_reality_and_room_verdict(duel_env):
 
 
 async def test_close_reveal_upset_when_room_picked_the_flop(duel_env):
-    view, _ = await _open_community_duel(duel_env)
-    hi_is_a = view._card_a["id"] == 1
-    v = _interaction(_member(10, role_ids=()))
-    await view._vote(v, "b" if hi_is_a else "a")  # the room picks the LOW card
-    msg = MagicMock(spec=discord.Message)
-    msg.edit = AsyncMock()
-    view.bind_message(msg)
-    await view.on_timeout()
+    mid, _ = await _open_community_duel(duel_env)
+    ca, _cb = _served_cards(duel_env, mid)
+    hi_is_a = ca["id"] == 1
+    await _cast(duel_env, _member(10, role_ids=()), "b" if hi_is_a else "a", mid)  # picks the LOW card
     reality = next(
-        f for f in msg.edit.call_args.kwargs["embed"].fields if f.name == "reality"
+        f for f in (await _closed_embed(duel_env, mid)).fields if f.name == "reality"
     ).value
     assert "upset — the room picked the other one" in reality
     assert "the room called it" not in reality
@@ -619,13 +670,9 @@ async def test_close_reveal_upset_when_room_picked_the_flop(duel_env):
 async def test_close_reveal_omits_room_line_on_vote_tie(duel_env):
     """No votes (0–0) → nothing to compare — the room-vs-reality line is omitted,
     the reality numbers still show."""
-    view, _ = await _open_community_duel(duel_env)
-    msg = MagicMock(spec=discord.Message)
-    msg.edit = AsyncMock()
-    view.bind_message(msg)
-    await view.on_timeout()
+    mid, _ = await _open_community_duel(duel_env)
     reality = next(
-        f for f in msg.edit.call_args.kwargs["embed"].fields if f.name == "reality"
+        f for f in (await _closed_embed(duel_env, mid)).fields if f.name == "reality"
     ).value
     assert "popped" in reality
     assert "room" not in reality and "upset" not in reality
@@ -655,9 +702,8 @@ async def test_invalid_community_card_is_dropped(duel_env, bad_payload):
 async def test_community_votes_still_write_actor_kind_community(duel_env):
     """The vote substrate is UNCHANGED on the community path: keep + pair_loser_id,
     actor_kind='community', surface='discord'."""
-    view, _ = await _open_community_duel(duel_env)
-    v = _interaction(_member(10, role_ids=()))
-    await view._vote(v, "a")
+    mid, _ = await _open_community_duel(duel_env)
+    await _cast(duel_env, _member(10, role_ids=()), "a", mid)
     row = duel_env.execute(
         "SELECT actor, actor_kind, decision, surface, candidate_id, pair_loser_id "
         "FROM content_deck_decisions"
@@ -759,9 +805,8 @@ async def test_cards_render_side_by_side_and_links_only_at_close(monkeypatch, du
     # answer-leak guard: NO tweet link anywhere while the vote is open
     assert "x.com" not in str(open_embed.to_dict())
 
-    view = i.channel.send.call_args.kwargs["view"]
-    closed = mod._duel_embed("solstitch", view._card_a, view._card_b,
-                             votes=1, closed=True, tally=(1, 0))
+    ca, cb = _served_cards(duel_env, i.channel.send.return_value.id)
+    closed = mod._duel_embed("solstitch", ca, cb, votes=1, closed=True, tally=(1, 0))
     links = next(f for f in closed.fields if f.name == "the tweets")
     assert "https://x.com/gabbyvorbeck/status/1938291000000000000" in links.value
     assert "https://x.com/syebastian/status/1938291000000000000" in links.value
@@ -1170,3 +1215,59 @@ async def test_general_channel_empty_profile_serves_anything(monkeypatch, duel_e
     i = _interaction(_member(1, role_ids=()), channel_id=702)  # general — no topic filter
     await mod._handle_duel(i)
     i.channel.send.assert_called_once()  # off-topic cards are fine in general
+
+
+# --- restart durability (persistent view + durable close sweep, mig 084) ------
+
+def test_persistent_view_has_static_custom_ids():
+    """The view is registered ONCE (client.add_view) and routes clicks on any duel message
+    by static custom_id — the whole point of surviving a restart."""
+    view = mod._DuelView()
+    assert view.timeout is None  # persistent
+    cids = {c.custom_id for c in view.children if isinstance(c, discord.ui.Button)}
+    assert cids == {"duel:vote:a", "duel:vote:b"}
+
+
+async def test_vote_works_on_a_fresh_view_instance(duel_env):
+    """After a 'restart' the original view object is gone — a click on the old message goes
+    to a FRESH _DuelView() and must still record (state is looked up by message_id)."""
+    mid = await _open_duel(duel_env)
+    # a brand-new view instance (what add_view holds post-restart) handles the click
+    vi = _vote_interaction(_member(10, role_ids=()), mid)
+    await mod._DuelView()._vote(vi, "a")
+    n = duel_env.execute("SELECT COUNT(*) FROM content_deck_decisions").fetchone()[0]
+    assert n == 1
+
+
+async def test_startup_sweep_closes_a_duel_that_expired_during_downtime(duel_env):
+    """The close is driven by the durable sweep, not a view timeout — a duel whose deadline
+    passed WHILE THE BOT WAS DOWN is revealed on the next sweep (find due → close each)."""
+    mid = await _open_duel(duel_env)
+    await _cast(duel_env, _member(10, role_ids=()), "a", mid)
+    # its deadline lapsed during downtime
+    duel_env.execute("UPDATE content_duels SET deadline='2000-01-01T00:00:00Z' WHERE message_id=?",
+                     (mid,))
+    duel_env.commit()
+    # the sweep body: find due, close each
+    due = mod.cduels.list_due_duels(duel_env)
+    assert [d["message_id"] for d in due] == [mid]
+    edited = MagicMock(spec=discord.Message); edited.edit = AsyncMock()
+    await mod._close_one(_fake_client(edited), due[0])
+    assert edited.edit.called
+    closed = edited.edit.call_args.kwargs["embed"]
+    assert any("🅰 1 — 0 🅱" in f.value for f in closed.fields)  # revealed the real tally
+    assert mod.cduels.get_duel(duel_env, mid)["status"] == "closed"
+
+
+async def test_reveal_edit_failure_still_marks_closed(duel_env):
+    """A deleted message / kicked bot at close: the row is still marked closed (no infinite
+    retry) and votes were already durable."""
+    mid = await _open_duel(duel_env)
+    duel = mod.cduels.get_duel(duel_env, mid)
+    client = MagicMock()
+    channel = MagicMock()
+    resp = MagicMock(); resp.status = 404
+    channel.fetch_message = AsyncMock(side_effect=discord.NotFound(resp, "gone"))
+    client.get_channel = MagicMock(return_value=channel)
+    await mod._close_one(client, duel)
+    assert mod.cduels.get_duel(duel_env, mid)["status"] == "closed"

@@ -35,14 +35,19 @@ import json
 import logging
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import discord
 from discord import app_commands
+from discord.ext import tasks
 
 from sable_platform.db import content_deck as cd_db
 from sable_platform.db.audit import log_audit
 from sable_platform.db.connection import get_db
+try:
+    from sable_platform.db import content_duels as cduels
+except ImportError:  # older SablePlatform (pre-mig-084) — durable duels degrade off
+    cduels = None  # type: ignore[assignment]
 try:
     from sable_platform.db.orgs import get_org_config_value
 except ImportError:  # older SablePlatform without the accessor — the gate FAILS CLOSED
@@ -554,152 +559,242 @@ def _duel_embed(org: str, card_a: dict, card_b: dict, *, votes: int, closed: boo
     return embed
 
 
+# Same-tick double-click guard: a stateless persistent view can't see an in-flight sibling
+# click, and the durable has_recent_duel_vote can't see an UNCOMMITTED one — so a (message,
+# user) that's mid-write is held here for the ms it takes to commit. Cross-restart re-votes
+# are caught durably; this only closes the same-instant race. In-process (single bot).
+_VOTING: set = set()
+
+
+def _record_vote(message_id: str, choice: str, user_id: int):
+    """Worker-thread vote path for the PERSISTENT view. Looks the duel up by message_id
+    (state lives in the mig-084 row, not the view), records the vote durably, and returns:
+    None (duel gone/closed), 'dup' (durable guard says already voted), or
+    (org, card_a, card_b, total_votes) to refresh the blind count."""
+    if cduels is None:
+        return None
+    with get_db() as conn:
+        duel = cduels.get_duel(conn, message_id)
+        if duel is None or duel["status"] != "open":
+            return None
+        if str(duel["deadline"]) <= _now_iso():
+            # past the hard deadline but the sweep hasn't closed it yet — refuse the vote
+            # (ISO-Z compares lexically; both are UTC) so nothing trickles in post-deadline.
+            return None
+        org = duel["org_id"]
+        try:
+            card_a = json.loads(duel["card_a_json"])
+            card_b = json.loads(duel["card_b_json"])
+        except (ValueError, TypeError):
+            return None
+        winner, loser = (card_a, card_b) if choice == "a" else (card_b, card_a)
+        actor = f"discord:user:{user_id}"
+        if cd_db.has_recent_duel_vote(
+            conn, org, actor=actor,
+            candidate_ids=(int(card_a["id"]), int(card_b["id"])),
+            since=duel["opened_at"],
+        ):
+            return "dup"
+        cd_db.record_deck_decision(
+            conn, candidate_id=int(winner["id"]), org_id=org, actor=actor,
+            actor_kind="community", decision="keep", surface="discord",
+            pair_loser_id=int(loser["id"]),
+        )
+        log_audit(
+            conn, actor, "content_duel_vote", org_id=org,
+            detail={"guild_id": duel["guild_id"], "winner_id": int(winner["id"]),
+                    "loser_id": int(loser["id"]), "choice": choice},
+            source="sable-roles",
+        )
+        conn.commit()
+        va, vb = cduels.count_duel_votes(
+            conn, org, int(card_a["id"]), int(card_b["id"]), duel["opened_at"]
+        )
+    return org, card_a, card_b, va + vb
+
+
 class _DuelView(discord.ui.View):
-    """OPEN-voting view (the bot's first non-author-locked View): any guild member may
-    press 🅰/🅱 once. Vote dedup = in-View dict backed by the durable DB check; each
-    vote writes its decision row IMMEDIATELY (a restart never loses recorded votes).
-    Buttons disable + the blind tally reveals on timeout."""
+    """PERSISTENT open-voting view (``timeout=None``, static ``custom_id`` buttons). ONE
+    instance is registered via ``client.add_view`` at startup and routes button clicks on
+    EVERY duel message — this session's AND any posted before a restart — by looking the
+    duel up by ``interaction.message.id`` (per-duel state lives in the mig-084 content_duels
+    row, not on the instance). The close/reveal is driven by the durable sweep (not a view
+    timeout), so a 24h duel survives a bot restart. Any member votes once (durable guard)."""
 
-    def __init__(self, *, org: str, guild_id: str, channel_id: str, card_a: dict,
-                 card_b: dict) -> None:
-        super().__init__(timeout=float(_DUEL_OPEN_SECONDS))
-        self._org = org
-        self._guild_id = guild_id
-        self._channel_id = str(channel_id)
-        self._card_a = card_a
-        self._card_b = card_b
-        self._opened_at = _now_iso()
-        # HARD deadline (monotonic): View.timeout alone is an inactivity timer that
-        # refreshes on every press (Codex F4) — after each vote we shrink it to the
-        # REMAINING wall-clock so the duel always closes by the deadline.
-        self._deadline = time.monotonic() + _DUEL_OPEN_SECONDS
-        self._votes: dict[int, str] = {}
-        self._message: discord.Message | None = None
-
-    def bind_message(self, message: discord.Message) -> None:
-        self._message = message
-
-    def _remaining(self) -> float:
-        return self._deadline - time.monotonic()
-
-    def _vote_count(self) -> int:
-        """Real recorded choices only — dedup markers like '(pre-restart)' don't count,
-        so the displayed total always equals the closing 🅰+🅱 tally."""
-        return sum(1 for c in self._votes.values() if c in ("a", "b"))
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
 
     async def _vote(self, interaction: discord.Interaction, choice: str) -> None:
         user = interaction.user
         if user.bot:
             return
-        if user.id in self._votes:
+        mid = str(interaction.message.id)
+        key = (mid, user.id)
+        if key in _VOTING:  # a sibling click for this (message, user) is still committing
             await interaction.response.send_message(
-                "you already voted on this duel.", ephemeral=True,
-                allowed_mentions=_NO_MENTIONS,
+                "one sec — counting your vote…", ephemeral=True, allowed_mentions=_NO_MENTIONS,
             )
             return
-        if self._remaining() <= 0:
-            # past the hard deadline but on_timeout hasn't fired yet (inactivity-timer
-            # race at the boundary) — refuse the vote and let the close land.
-            await interaction.response.send_message(
-                "this duel just closed.", ephemeral=True, allowed_mentions=_NO_MENTIONS,
-            )
-            return
-        winner = self._card_a if choice == "a" else self._card_b
-        loser = self._card_b if choice == "a" else self._card_a
-        actor = f"discord:user:{user.id}"
-        # PRE-MARK before any await (T2-1): discord.py dispatches each click as its own
-        # task, so two rapid clicks would BOTH pass the dict check above and reach the
-        # worker thread — the durable guard can't see an uncommitted sibling insert.
-        # Marking synchronously here makes the second task hit the already-voted branch;
-        # rolled back below if the write fails (the member may retry).
-        self._votes[user.id] = choice
-
-        def _record_sync() -> bool:
-            """True = recorded; False = the durable guard says this member already
-            voted. Runs in a worker thread (Codex F5) — the public-voting path must
-            never stall the gateway event loop on a slow Postgres round-trip."""
-            with get_db() as conn:
-                if cd_db.has_recent_duel_vote(
-                    conn, self._org, actor=actor,
-                    candidate_ids=(int(winner["id"]), int(loser["id"])),
-                    since=self._opened_at,
-                ):
-                    return False
-                cd_db.record_deck_decision(
-                    conn,
-                    candidate_id=int(winner["id"]),
-                    org_id=self._org,
-                    actor=actor,
-                    actor_kind="community",
-                    decision="keep",
-                    surface="discord",
-                    pair_loser_id=int(loser["id"]),
-                )
-                conn.commit()
-                log_audit(
-                    conn, actor, "content_duel_vote", org_id=self._org,
-                    detail={
-                        "guild_id": self._guild_id, "winner_id": int(winner["id"]),
-                        "loser_id": int(loser["id"]), "choice": choice,
-                    },
-                    source="sable-roles",
-                )
-            return True
-
+        _VOTING.add(key)
         try:
-            recorded = await asyncio.to_thread(_record_sync)
+            outcome = await asyncio.to_thread(_record_vote, mid, choice, user.id)
         except Exception as exc:  # noqa: BLE001 — a failed write must not eat the interaction
-            self._votes.pop(user.id, None)  # roll back the pre-mark — the member may retry
-            logger.warning("duel vote write failed for %s/%s: %s", self._org, actor, exc)
+            logger.warning("duel vote write failed for msg %s: %s", mid, exc)
             await interaction.response.send_message(
                 "couldn't record that vote — try again in a moment.", ephemeral=True,
                 allowed_mentions=_NO_MENTIONS,
             )
             return
-        if not recorded:
-            # they DID vote (pre-restart) — keep them marked, but as a non-counting entry
-            self._votes[user.id] = "(pre-restart)"
+        finally:
+            _VOTING.discard(key)
+        if outcome is None:
             await interaction.response.send_message(
-                "you already voted on this duel.", ephemeral=True,
+                "this duel has ended.", ephemeral=True, allowed_mentions=_NO_MENTIONS,
+            )
+        elif outcome == "dup":
+            await interaction.response.send_message(
+                "you already voted on this duel.", ephemeral=True, allowed_mentions=_NO_MENTIONS,
+            )
+        else:
+            org, card_a, card_b, count = outcome
+            # refresh the BLIND count for everyone (edits the shared message, no herding)
+            await interaction.response.edit_message(
+                embed=_duel_embed(org, card_a, card_b, votes=count), view=self,
                 allowed_mentions=_NO_MENTIONS,
             )
-            return
-        # shrink the inactivity timer to the REMAINING wall-clock (Codex F4) so steady
-        # voting can never extend the duel past its deadline.
-        self.timeout = max(1.0, self._remaining())
-        await interaction.response.edit_message(
-            embed=_duel_embed(self._org, self._card_a, self._card_b, votes=self._vote_count()),
-            view=self, allowed_mentions=_NO_MENTIONS,
-        )
 
-    @discord.ui.button(label="🅰 this one", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="🅰 this one", style=discord.ButtonStyle.primary,
+                       custom_id="duel:vote:a")
     async def vote_a(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self._vote(interaction, "a")
 
-    @discord.ui.button(label="🅱 this one", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="🅱 this one", style=discord.ButtonStyle.primary,
+                       custom_id="duel:vote:b")
     async def vote_b(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self._vote(interaction, "b")
 
-    async def on_timeout(self) -> None:
-        _OPEN_DUELS.pop(self._channel_id, None)
-        for child in self.children:
-            if isinstance(child, discord.ui.Button):
-                child.disabled = True
-        tally = (
-            sum(1 for c in self._votes.values() if c == "a"),
-            sum(1 for c in self._votes.values() if c == "b"),
+
+# --- durable close scheduler -------------------------------------------------
+# discord.py Views don't survive a restart, so the reveal is driven by a background sweep
+# over the mig-084 registry instead of the view's on_timeout — a 24h duel reveals at its
+# deadline even if the bot restarted since it opened. A startup pass closes any that expired
+# while the bot was down (list_due_duels is a plain deadline<=now query).
+_client: discord.Client | None = None
+_CLOSE_INTERVAL_SECONDS = 60
+
+
+def register(client: discord.Client) -> None:
+    """Wire the PERSISTENT duel view + start the durable close sweep. Call once from
+    setup_hook under feature_enabled('duel')."""
+    global _client
+    _client = client
+    client.add_view(_DuelView())  # routes clicks on every duel message (incl. pre-restart)
+    if cduels is not None and not _close_loop.is_running():
+        _close_loop.start()
+
+
+def stop_tasks() -> None:
+    if _close_loop.is_running():
+        _close_loop.cancel()
+
+
+def _list_due_sync() -> list[dict]:
+    with get_db() as conn:
+        return cduels.list_due_duels(conn)
+
+
+def _claim_close_sync(message_id: str) -> bool:
+    with get_db() as conn:
+        claimed = cduels.close_duel(conn, message_id)
+        conn.commit()
+        return claimed
+
+
+def _tally_sync(org: str, a_id: int, b_id: int, since: str) -> tuple[int, int]:
+    with get_db() as conn:
+        return cduels.count_duel_votes(conn, org, a_id, b_id, since)
+
+
+async def _close_one(client: discord.Client, duel: dict) -> None:
+    mid = duel["message_id"]
+    # SINGLE-FLIGHT claim first: only one sweep (or the startup pass) reveals a given duel.
+    if not await asyncio.to_thread(_claim_close_sync, mid):
+        return
+    org = duel["org_id"]
+    try:
+        card_a = json.loads(duel["card_a_json"])
+        card_b = json.loads(duel["card_b_json"])
+    except (ValueError, TypeError):
+        return
+    va, vb = await asyncio.to_thread(
+        _tally_sync, org, int(card_a["id"]), int(card_b["id"]), duel["opened_at"]
+    )
+    embed = _duel_embed(org, card_a, card_b, votes=va + vb, closed=True, tally=(va, vb))
+    view = _DuelView()
+    for c in view.children:
+        if isinstance(c, discord.ui.Button):
+            c.disabled = True
+    try:
+        channel = client.get_channel(int(duel["channel_id"]))
+        if channel is None:
+            channel = await client.fetch_channel(int(duel["channel_id"]))
+        msg = await channel.fetch_message(int(mid))
+        await msg.edit(embed=embed, view=view, allowed_mentions=_NO_MENTIONS)
+    except discord.HTTPException as exc:
+        # the row is already 'closed'; a deleted message / kicked bot just means no visible
+        # reveal (never retried — the re-claim would fail anyway). Votes are already saved.
+        logger.warning("duel reveal edit failed for %s: %s", mid, exc)
+
+
+@tasks.loop(seconds=_CLOSE_INTERVAL_SECONDS)
+async def _close_loop() -> None:
+    if _client is None or cduels is None:
+        return
+    try:
+        due = await asyncio.to_thread(_list_due_sync)
+    except Exception as exc:  # noqa: BLE001 — a sweep hiccup must never crash the loop
+        logger.warning("duel close sweep: due-list failed: %s", exc)
+        return
+    for duel in due:
+        try:
+            await _close_one(_client, duel)
+        except Exception as exc:  # noqa: BLE001 — one bad duel never blocks the rest
+            logger.warning("duel close failed for %s: %s", duel.get("message_id"), exc)
+
+
+@_close_loop.before_loop
+async def _before_close_loop() -> None:
+    if _client is not None:
+        await _client.wait_until_ready()  # need a live gateway to fetch/edit messages
+
+
+def _channel_busy(channel_id: str) -> bool:
+    """Durable per-channel lock — is an OPEN duel already live in this channel? (Survives a
+    restart, unlike the in-memory reservation.) FAIL-OPEN: a read error returns False so a
+    broken DB never blocks all duels; the in-memory reservation still guards double-clicks."""
+    if cduels is None:
+        return False
+    try:
+        with get_db() as conn:
+            return cduels.channel_has_open_duel(conn, channel_id)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _record_open_duel(message_id: str, org: str, guild_id: str, channel_id: str,
+                      card_a: dict, card_b: dict, opened_at: str, deadline: str) -> None:
+    """Persist the freshly-posted duel (mig-084) so it survives a restart. Best-effort — if
+    the write fails the duel still works this session (in-memory view), it just won't be
+    restart-durable or auto-closed; logged, never raised."""
+    if cduels is None:
+        return
+    with get_db() as conn:
+        cduels.open_duel(
+            conn, message_id=message_id, org_id=org, guild_id=guild_id,
+            channel_id=channel_id, card_a_json=json.dumps(card_a),
+            card_b_json=json.dumps(card_b), opened_at=opened_at, deadline=deadline,
         )
-        if self._message is not None:
-            try:
-                await self._message.edit(
-                    embed=_duel_embed(
-                        self._org, self._card_a, self._card_b,
-                        votes=self._vote_count(), closed=True, tally=tally,
-                    ),
-                    view=self, allowed_mentions=_NO_MENTIONS,
-                )
-            except discord.HTTPException as exc:
-                logger.warning("duel close edit failed: %s", exc)
+        conn.commit()
 
 
 def _load_pair(org: str, kinds: tuple[str, ...] | None = None,
@@ -800,11 +895,13 @@ async def _handle_duel(interaction: discord.Interaction) -> None:
             "disclosure isn't on file).", ephemeral=True, allowed_mentions=_NO_MENTIONS,
         )
         return
-    # F2: one open duel per CHANNEL — a second /duel while one is live in THIS channel
-    # (or a double-click before any vote lands, which the SP 12h exclusion can't see) is
-    # refused; a different channel is fine (concurrent duels across channels).
+    # F2: one open duel per CHANNEL — a second /duel while one is live in THIS channel is
+    # refused (a different channel is fine — concurrent duels across channels). The DURABLE
+    # check (mig-084 registry) survives a restart; the in-memory reservation additionally
+    # closes the sub-second double-click before the durable row is inserted.
     channel_key = str(interaction.channel_id)
-    if _OPEN_DUELS.get(channel_key, 0.0) > time.monotonic():
+    if _OPEN_DUELS.get(channel_key, 0.0) > time.monotonic() or \
+            await asyncio.to_thread(_channel_busy, channel_key):
         await interaction.response.send_message(
             "a duel is already open in this channel — let it finish first.",
             ephemeral=True, allowed_mentions=_NO_MENTIONS,
@@ -857,12 +954,10 @@ async def _handle_duel(interaction: discord.Interaction) -> None:
         )
         return
     card_a, card_b = pair[0], pair[1]
-    view = _DuelView(org=org, guild_id=str(interaction.guild_id), channel_id=channel_key,
-                     card_a=card_a, card_b=card_b)
+    view = _DuelView()  # PERSISTENT (stateless) — clicks route by message_id, not instance
     # Post the duel as a REGULAR bot channel message, not the interaction response: an
-    # interaction's webhook token expires after 15 minutes — exactly this View's
-    # lifetime — so the closing-tally edit on an interaction-owned message would 401.
-    # A bot-authored message stays editable forever.
+    # interaction's webhook token expires after 15 minutes, so the closing-tally edit on an
+    # interaction-owned message would 401 — a bot-authored message stays editable forever.
     channel = interaction.channel
     if channel is None or not hasattr(channel, "send"):
         await interaction.response.send_message(
@@ -873,9 +968,11 @@ async def _handle_duel(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(
         "duel posted ⚔", ephemeral=True, allowed_mentions=_NO_MENTIONS,
     )
-    # claim the org lock only once the ack landed — an ack failure must never leave the
-    # org duel-locked with no duel (adversarial T3); the send-failure path below releases.
-    _OPEN_DUELS[channel_key] = time.monotonic() + _DUEL_OPEN_SECONDS
+    # Short in-memory reservation (anti-double-click) claimed once the ack landed — an ack
+    # failure must never leave the channel duel-locked with no duel (adversarial T3). The
+    # send-failure path below releases it; the DURABLE 24h lock is the content_duels row
+    # inserted after the post succeeds.
+    _OPEN_DUELS[channel_key] = time.monotonic() + 60
     try:
         message = await channel.send(
             embed=_duel_embed(org, card_a, card_b, votes=0), view=view,
@@ -896,7 +993,18 @@ async def _handle_duel(interaction: discord.Interaction) -> None:
         except discord.HTTPException:
             pass
         raise
-    view.bind_message(message)
+    # Persist the duel (mig-084) so it survives a restart: the persistent view rebinds by
+    # message_id, and the close sweep reveals it at the deadline even across a restart.
+    opened_at = _now_iso()
+    deadline = (datetime.now(timezone.utc)
+                + timedelta(seconds=_DUEL_OPEN_SECONDS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        await asyncio.to_thread(
+            _record_open_duel, str(message.id), org, str(interaction.guild_id),
+            channel_key, card_a, card_b, opened_at, deadline,
+        )
+    except Exception as exc:  # noqa: BLE001 — a failed persist leaves a working (non-durable) duel
+        logger.warning("duel persist failed for %s (duel still live this session): %s", org, exc)
     try:
         with get_db() as conn:
             log_audit(
