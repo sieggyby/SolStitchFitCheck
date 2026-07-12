@@ -1398,3 +1398,86 @@ async def test_duel_revoke_clears_channel_restriction(duel_env, db_conn):
     await mod._handle_starter_change(i, _member(777, role_ids=()), grant=False)
     assert "777" not in mod._starter_channels("solstitch")
     assert "777" not in (json.loads(_config(db_conn)) or [])
+
+
+# --- org-level channel allowlist (duel_allowed_channels) ----------------------
+
+def _set_allowed_channels(conn, channel_ids, org="solstitch"):
+    """Merge duel_allowed_channels into the org config (preserves disclosure/kinds)."""
+    row = conn.execute("SELECT config_json FROM orgs WHERE org_id=?", (org,)).fetchone()
+    cfg = json.loads(row[0]) if row and row[0] else {}
+    cfg["duel_allowed_channels"] = json.dumps([str(c) for c in channel_ids])
+    conn.execute("UPDATE orgs SET config_json=? WHERE org_id=?", (json.dumps(cfg), org))
+    conn.commit()
+
+
+async def test_allowlist_blocks_unlisted_channel(monkeypatch, duel_env, db_conn):
+    """The game is invokable ONLY in the org's designated duel channels."""
+    monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["50"]})
+    _zh_ready(db_conn)
+    _set_allowed_channels(db_conn, [700])          # only channel 700 is a duel channel
+    no = _interaction(_member(50, role_ids=()), channel_id=999)
+    await mod._handle_duel(no)
+    no.channel.send.assert_not_called()
+    assert "aren't set up for this channel" in _sent_text(no)
+
+
+async def test_allowlist_permits_listed_channel(monkeypatch, duel_env, db_conn):
+    monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["50"]})
+    _zh_ready(db_conn)
+    _set_allowed_channels(db_conn, [700])
+    ok = _interaction(_member(50, role_ids=()), channel_id=700)
+    await mod._handle_duel(ok)
+    ok.channel.send.assert_called_once()
+
+
+async def test_no_allowlist_means_any_channel(monkeypatch, duel_env, db_conn):
+    """Backward compat: with no duel_allowed_channels set, /duel works anywhere (legacy)."""
+    monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["50"]})
+    _zh_ready(db_conn)  # no allowlist
+    i = _interaction(_member(50, role_ids=()), channel_id=12345)
+    await mod._handle_duel(i)
+    i.channel.send.assert_called_once()
+
+
+async def test_allowlist_unions_profiled_channels(monkeypatch, duel_env, db_conn):
+    """A channel with a duel_channels content profile is implicitly allowed even if it's
+    not in the explicit duel_allowed_channels list (the allowlist can't contradict routing)."""
+    monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["50"]})
+    _zh_ready(db_conn)
+    cfg = json.loads(db_conn.execute("SELECT config_json FROM orgs WHERE org_id='solstitch'").fetchone()[0])
+    cfg["duel_allowed_channels"] = json.dumps(["700"])          # explicit names only 700
+    cfg["duel_channels"] = json.dumps({"800": {"label": "x"}})  # 800 allowed via its profile
+    db_conn.execute("UPDATE orgs SET config_json=? WHERE org_id='solstitch'", (json.dumps(cfg),))
+    db_conn.commit()
+    i = _interaction(_member(50, role_ids=()), channel_id=800)
+    await mod._handle_duel(i)
+    i.channel.send.assert_called_once()
+
+
+async def test_allowlist_bounds_even_unlimited_starter(monkeypatch, duel_env, db_conn):
+    """The org allowlist bounds EVERYONE — an unlimited starter (Arf) is still refused in a
+    non-duel channel (this is not the per-user overlay, it's the game-wide gate)."""
+    monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["402620324744790017"]})
+    _set_unlimited(db_conn, ["402620324744790017"])
+    _seed_pending(db_conn, 1, kind="community_tweet", payload=_ct_payload(author="a"))
+    _seed_pending(db_conn, 2, kind="community_tweet", payload=_ct_payload(author="b"))
+    _set_allowed_channels(db_conn, [700])
+    i = _interaction(_member(402620324744790017, role_ids=()), channel_id=999)
+    await mod._handle_duel(i)
+    i.channel.send.assert_not_called()
+    assert "aren't set up for this channel" in _sent_text(i)
+
+
+async def test_allowed_channels_reader_unit(duel_env, db_conn):
+    cfg = json.loads(db_conn.execute("SELECT config_json FROM orgs WHERE org_id='solstitch'").fetchone()[0])
+    cfg["duel_allowed_channels"] = json.dumps(["700", "701"])
+    cfg["duel_channels"] = json.dumps({"800": {"lang": "zh"}})
+    db_conn.execute("UPDATE orgs SET config_json=? WHERE org_id='solstitch'", (json.dumps(cfg),))
+    db_conn.commit()
+    assert mod._allowed_channels("solstitch") == {"700", "701", "800"}
+    # empty list → None (legacy "anywhere"), never "nowhere"
+    cfg["duel_allowed_channels"] = json.dumps([])
+    db_conn.execute("UPDATE orgs SET config_json=? WHERE org_id='solstitch'", (json.dumps(cfg),))
+    db_conn.commit()
+    assert mod._allowed_channels("solstitch") is None

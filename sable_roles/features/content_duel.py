@@ -153,6 +153,49 @@ _STARTERS_KEY = "duel_starters_extra"
 # they otherwise could (env/extra/MOD_ROLES). Set via /duel-allow @user channel:#x.
 _STARTER_CHANNELS_KEY = "duel_starter_channels"
 
+# ORG-LEVEL channel allowlist (orgs.config_json). ``duel_allowed_channels`` is a JSON list
+# of channel ids where /duel may be started AT ALL — the game is invokable ONLY in these
+# channels (+ any channel that has a ``duel_channels`` content profile, unioned in so the
+# allowlist can never contradict configured routing). UNSET / not-a-non-empty-list → None,
+# meaning legacy "any channel". This is the "don't let the game run everywhere, only in the
+# 2-3 designated channels (more as languages grow)" gate — add a language channel by adding
+# its id here. Distinct from the per-USER ``duel_starter_channels`` overlay: this bounds the
+# game for EVERYONE (incl. unlimited starters like Arf); that bounds one user.
+_ALLOWED_CHANNELS_KEY = "duel_allowed_channels"
+
+
+def _allowed_channels(org: str | None) -> set[str] | None:
+    """The org's designated duel channels — /duel is refused outside this set. Returns None
+    when no allowlist is configured (legacy: any channel). The set is the explicit
+    ``duel_allowed_channels`` list UNIONED with the keys of ``duel_channels`` (a channel you
+    gave a content profile is obviously a duel channel), so the allowlist can't accidentally
+    lock out a routed channel. FAIL-OPEN: a broken read → None (a DB blip never takes the
+    whole game offline; the disclosure gate is the real consent boundary, not this UX limit)."""
+    if org is None or get_org_config_value is None:
+        return None
+    try:
+        with get_db() as conn:
+            raw = get_org_config_value(conn, org, _ALLOWED_CHANNELS_KEY)
+            channels = get_org_config_value(conn, org, _CHANNELS_KEY)
+    except Exception:  # noqa: BLE001 — a broken read never locks the game out of every channel
+        return None
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (ValueError, TypeError):
+            raw = None
+    if not isinstance(raw, list) or not raw:
+        return None  # no allowlist configured → legacy "anywhere"
+    allowed = {str(c) for c in raw}
+    if isinstance(channels, str):
+        try:
+            channels = json.loads(channels)
+        except (ValueError, TypeError):
+            channels = None
+    if isinstance(channels, dict):
+        allowed |= {str(k) for k in channels}  # profiled channels are implicitly allowed
+    return allowed
+
 
 def _starter_channels(org: str | None) -> dict:
     """The per-user channel-restriction overlay ({user_id: [channel_id,…]}). FAIL-SAFE:
@@ -924,6 +967,17 @@ async def _handle_duel(interaction: discord.Interaction) -> None:
             ephemeral=True, allowed_mentions=_NO_MENTIONS,
         )
         return
+    # ORG channel allowlist: the game runs ONLY in the server's designated duel channels
+    # (english general, the meme channel, the Prometheus channel, each language channel, …)
+    # — never "anywhere". A would-be starter in a non-duel channel is pointed elsewhere. This
+    # bounds EVERYONE, including unlimited starters (Arf), unlike the per-user overlay above.
+    allowed = await asyncio.to_thread(_allowed_channels, org)
+    if allowed is not None and str(interaction.channel_id) not in allowed:
+        await interaction.response.send_message(
+            "duels aren't set up for this channel — run /duel in one of the server's "
+            "designated duel channels.", ephemeral=True, allowed_mentions=_NO_MENTIONS,
+        )
+        return
     if not await asyncio.to_thread(_disclosure_signed, org):
         await interaction.response.send_message(
             "community duels aren't enabled for this server (the client's data-use "
@@ -1257,7 +1311,13 @@ async def _handle_list_starters(interaction: discord.Interaction) -> None:
     seeded = [str(s) for s in DUEL_STARTERS.get(guild_id, []) or []]
     extra = sorted(await asyncio.to_thread(_extra_starters, org))
     chmap = await asyncio.to_thread(_starter_channels, org)
+    allowed = await asyncio.to_thread(_allowed_channels, org)
     lines = []
+    if allowed is not None:
+        lines.append("**duel channels:** " + " ".join(f"<#{c}>" for c in sorted(allowed))
+                     + "  _(duels can only be started here)_")
+    else:
+        lines.append("**duel channels:** any channel _(no allowlist set)_")
     if seeded:
         lines.append("**team-seeded:** " + " ".join(f"<@{u}>" for u in seeded))
     if extra:
