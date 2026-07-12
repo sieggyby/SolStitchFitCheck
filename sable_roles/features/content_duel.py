@@ -122,21 +122,23 @@ _AUTHOR_HANDLE_RE = re.compile(r"^[A-Za-z0-9_]{1,15}$")
 # unreliable — same call as the ingest-side ranking).
 _ENGAGEMENT_KEYS = ("likes", "retweets", "replies", "quotes")
 
-# F2: one OPEN duel per CHANNEL at a time (an in-process registry: channel_id ->
-# monotonic deadline; channel ids are globally unique). Stops two overlapping vote
-# widgets in one channel + a double-post of the same pair before any vote lands (the SP
-# 12h exclusion only sees recorded VOTES). Per-CHANNEL (not per-org) so concurrent duels
-# in DIFFERENT channels are allowed — an unlimited starter runs several at once, and the
-# per-channel daily cap is a separate durable limit (see _duel_opens_today). In-process
-# only — a restart forgets an open duel; residual: someone could re-open the same pair
-# early, whose votes still dedup durably. Single-process constraint (like every dict).
+# Per-USER anti-double-click reservation (in-process registry: user_id -> monotonic
+# expiry). NOT a rate limit — the durable per-user 24h cap below is that. This only closes
+# the sub-second double-submit window: discord.py can dispatch a slash invoke twice, and
+# the durable audit row that the cap counts isn't written until AFTER the post, so without
+# this a fast double-tap could post two duels. Short TTL (covers ack→post→audit); a restart
+# forgetting it is harmless (the audit-based cap still holds). Single-process (like every
+# dict). The old per-CHANNEL open lock was REMOVED 2026-07-12 — a live duel no longer blocks
+# a DIFFERENT starter in the same channel; the limit is now purely per-user (see below).
 _OPEN_DUELS: dict[str, float] = {}
+_DOUBLE_CLICK_GUARD_SECONDS = 30
 
-# Duel rate limit: every starter is capped at this many /duel opens per (channel, UTC
-# day), EXCEPT the ``duel_unlimited_starters`` org-config allowlist (e.g. Arf), who are
-# uncapped. Counted durably from the ``content_duel_opened`` audit trail (survives
-# restarts), so P0ison/Monasex get one duel per channel per day.
-_DUEL_DAILY_PER_CHANNEL = 1
+# Duel rate limit (relaxed 2026-07-12 to PER-USER): every starter opens at most this many
+# /duel duels per rolling 24 hours, across ANY channel, EXCEPT the
+# ``duel_unlimited_starters`` org-config allowlist (Arf), who are uncapped. Counted durably
+# from the ``content_duel_opened`` audit trail (survives restarts), so P0ison/Monasex/Rootz
+# each get one duel per 24h and are never blocked by someone else's live duel.
+_DUEL_PER_USER_24H = 1
 _UNLIMITED_KEY = "duel_unlimited_starters"
 
 
@@ -241,18 +243,26 @@ def _duel_unlimited(org: str, user_id: int | str) -> bool:
         return False
 
 
-def _duel_opens_today(org: str, user_id: int | str, channel_id: int | str | None) -> int:
-    """How many duels this user has already opened in this channel TODAY (UTC), counted
-    durably from the ``content_duel_opened`` audit trail (survives restarts). Matches on
-    the audit timestamp's date prefix (both dialects store UTC) + detail.channel_id.
+def _parse_audit_ts(raw) -> datetime | None:
+    """Parse an audit-log timestamp (either ``YYYY-MM-DDTHH:MM:SSZ`` from ``_now_iso`` or
+    ``YYYY-MM-DD HH:MM:SS`` from a DB default) to an aware UTC datetime. None on any
+    unparseable value (caller treats that as 'does not count')."""
+    s = str(raw).strip().replace("T", " ").rstrip("Z")[:19]
+    try:
+        return datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _duel_opens_last_24h(org: str, user_id: int | str) -> int:
+    """How many duels this user has opened in the last ROLLING 24 hours, across ALL
+    channels, counted durably from the ``content_duel_opened`` audit trail (survives
+    restarts). The limit is per-USER now (2026-07-12) — channel is no longer part of it.
     FAIL-OPEN: a broken read returns 0 (the rate limit is politeness, not security — a
     read error must never lock out a legitimate starter)."""
-    if channel_id is None:
-        return 0
     try:
         from sable_platform.db.audit import list_audit_log
 
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         with get_db() as conn:
             rows = list_audit_log(
                 conn, org_id=org, actor=f"discord:user:{user_id}",
@@ -260,16 +270,12 @@ def _duel_opens_today(org: str, user_id: int | str, channel_id: int | str | None
             )
     except Exception:  # noqa: BLE001 — fail-open, never block a starter on a read error
         return 0
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
     count = 0
     for r in rows:
         m = getattr(r, "_mapping", r)
-        if str(m["timestamp"])[:10] != today:
-            continue
-        try:
-            detail = json.loads(m["detail_json"] or "{}")
-        except (ValueError, TypeError):
-            detail = {}
-        if str(detail.get("channel_id")) == str(channel_id):
+        ts = _parse_audit_ts(m["timestamp"])
+        if ts is not None and ts >= cutoff:
             count += 1
     return count
 
@@ -805,19 +811,6 @@ async def _before_close_loop() -> None:
         await _client.wait_until_ready()  # need a live gateway to fetch/edit messages
 
 
-def _channel_busy(channel_id: str) -> bool:
-    """Durable per-channel lock — is an OPEN duel already live in this channel? (Survives a
-    restart, unlike the in-memory reservation.) FAIL-OPEN: a read error returns False so a
-    broken DB never blocks all duels; the in-memory reservation still guards double-clicks."""
-    if cduels is None:
-        return False
-    try:
-        with get_db() as conn:
-            return cduels.channel_has_open_duel(conn, channel_id)
-    except Exception:  # noqa: BLE001
-        return False
-
-
 def _record_open_duel(message_id: str, org: str, guild_id: str, channel_id: str,
                       card_a: dict, card_b: dict, opened_at: str, deadline: str) -> None:
     """Persist the freshly-posted duel (mig-084) so it survives a restart. Best-effort — if
@@ -937,28 +930,27 @@ async def _handle_duel(interaction: discord.Interaction) -> None:
             "disclosure isn't on file).", ephemeral=True, allowed_mentions=_NO_MENTIONS,
         )
         return
-    # F2: one open duel per CHANNEL — a second /duel while one is live in THIS channel is
-    # refused (a different channel is fine — concurrent duels across channels). The DURABLE
-    # check (mig-084 registry) survives a restart; the in-memory reservation additionally
-    # closes the sub-second double-click before the durable row is inserted.
     channel_key = str(interaction.channel_id)
-    if _OPEN_DUELS.get(channel_key, 0.0) > time.monotonic() or \
-            await asyncio.to_thread(_channel_busy, channel_key):
+    user_key = str(member.id)
+    # Anti-double-click: a fast double-submit by THIS user (before their durable audit row
+    # lands) would post two duels. The per-user reservation closes that sub-second window.
+    # It is NOT the rate limit — a live duel by anyone no longer blocks a different starter.
+    if _OPEN_DUELS.get(user_key, 0.0) > time.monotonic():
         await interaction.response.send_message(
-            "a duel is already open in this channel — let it finish first.",
+            "hang on — your last duel is still posting, try again in a moment.",
             ephemeral=True, allowed_mentions=_NO_MENTIONS,
         )
         return
-    # Rate limit: non-unlimited starters get _DUEL_DAILY_PER_CHANNEL opens per channel
-    # per UTC day (durable, from the audit trail). The unlimited allowlist (Arf) skips it.
+    # Rate limit: PER USER, one duel per rolling 24h across ANY channel (durable, from the
+    # audit trail). The unlimited allowlist (Arf) skips it. A duel runs 24h, so this is
+    # effectively "one live duel per person" — but a second person can still start in the
+    # same channel (the old per-channel lock was removed 2026-07-12).
     if not await asyncio.to_thread(_duel_unlimited, org, member.id):
-        opens = await asyncio.to_thread(
-            _duel_opens_today, org, member.id, interaction.channel_id
-        )
-        if opens >= _DUEL_DAILY_PER_CHANNEL:
+        opens = await asyncio.to_thread(_duel_opens_last_24h, org, member.id)
+        if opens >= _DUEL_PER_USER_24H:
             await interaction.response.send_message(
-                "you've already started a duel in this channel today — try another "
-                "channel, or check back tomorrow (resets at 00:00 UTC).",
+                "you've already started a duel in the last 24 hours — check back later "
+                "(one per person per day; each duel runs 24h).",
                 ephemeral=True, allowed_mentions=_NO_MENTIONS,
             )
             return
@@ -1010,18 +1002,18 @@ async def _handle_duel(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(
         "duel posted ⚔", ephemeral=True, allowed_mentions=_NO_MENTIONS,
     )
-    # Short in-memory reservation (anti-double-click) claimed once the ack landed — an ack
-    # failure must never leave the channel duel-locked with no duel (adversarial T3). The
-    # send-failure path below releases it; the DURABLE 24h lock is the content_duels row
-    # inserted after the post succeeds.
-    _OPEN_DUELS[channel_key] = time.monotonic() + 60
+    # Short per-user reservation (anti-double-click) claimed once the ack landed — an ack
+    # failure must never leave a user reservation-locked with no duel (adversarial T3). The
+    # send-failure path below releases it; the DURABLE per-user 24h cap is the
+    # content_duel_opened audit row written after the post succeeds.
+    _OPEN_DUELS[user_key] = time.monotonic() + _DOUBLE_CLICK_GUARD_SECONDS
     try:
         message = await channel.send(
             embed=_duel_embed(org, card_a, card_b, votes=0), view=view,
             allowed_mentions=_NO_MENTIONS,
         )
     except discord.HTTPException:
-        _OPEN_DUELS.pop(channel_key, None)  # never hold the lock for a duel that never posted
+        _OPEN_DUELS.pop(user_key, None)  # never hold the reservation for a duel that never posted
         # The ack above already said "posted" — correct the record so the starter isn't
         # left believing a duel is live somewhere (the mod-chat lesson: a private channel
         # the bot can't access 403s HERE, after a green ack). Best-effort: the correction

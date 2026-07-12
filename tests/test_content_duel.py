@@ -370,15 +370,28 @@ async def test_open_tally_is_blind_and_close_reveals(duel_env):
     assert mod.cduels.get_duel(duel_env, mid)["status"] == "closed"
 
 
-async def test_second_duel_refused_while_one_is_open(duel_env):
-    """A mod double-post (before any vote lands) is refused by the DURABLE per-channel lock
-    (the content_duels open row)."""
-    await _open_duel(duel_env)
+async def test_same_user_double_click_refused(duel_env):
+    """A user double-submitting /duel (before their durable audit row lands) is refused by
+    the per-user anti-double-click reservation — not two duels posted."""
+    await _open_duel(duel_env)  # user 1 posts; reservation now held for user 1
     _seed_pending(duel_env, 3)
     _seed_pending(duel_env, 4)
     i = _interaction(_member(1))
     await mod._handle_duel(i)
-    assert "already open" in _sent_text(i)
+    i.channel.send.assert_not_called()
+    assert "still posting" in _sent_text(i)
+
+
+async def test_different_user_can_open_in_same_channel(monkeypatch, duel_env):
+    """The Monasex fix: a live duel in a channel no longer blocks a DIFFERENT starter from
+    opening in the SAME channel (the per-channel lock was removed — the limit is per-user)."""
+    monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["1", "2"]})
+    await _open_duel(duel_env)  # user 1's duel is live in channel 500
+    _seed_pending(duel_env, 3)
+    _seed_pending(duel_env, 4)
+    i = _interaction(_member(2, role_ids=()), channel_id=500)  # different starter, same channel
+    await mod._handle_duel(i)
+    i.channel.send.assert_called_once()  # not blocked by user 1's live duel
 
 
 async def test_close_is_single_flight(duel_env):
@@ -1076,64 +1089,81 @@ def _zh_ready(conn):
     _seed_pending(conn, 2, kind="community_tweet", payload=_ct_payload(author="b"))
 
 
-async def test_non_unlimited_starter_capped_one_per_channel_per_day(monkeypatch, duel_env, db_conn):
-    """P0ison-style: one duel per channel per day. A prior open TODAY in this channel
-    (from the durable audit trail) blocks a second."""
+async def test_non_unlimited_starter_capped_one_per_24h(monkeypatch, duel_env, db_conn):
+    """P0ison-style: one duel per person per rolling 24h. A prior open in the last 24h
+    (from the durable audit trail) blocks a second — in ANY channel."""
     monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["50"]})
     _zh_ready(db_conn)  # writes disclosure+kinds, no unlimited list
-    _log_duel_open(db_conn, 50, 500)  # already opened one in channel 500 today
+    _log_duel_open(db_conn, 50, 500)  # already opened one within the last 24h
     i = _interaction(_member(50, role_ids=()), channel_id=500)
     await mod._handle_duel(i)
     i.channel.send.assert_not_called()
-    assert "already started a duel in this channel today" in _sent_text(i)
+    assert "in the last 24 hours" in _sent_text(i)
 
 
-async def test_cap_is_per_channel_other_channel_ok(monkeypatch, duel_env, db_conn):
-    """The cap is PER channel — a duel used in channel 500 doesn't block channel 600."""
+async def test_cap_is_per_user_across_channels(monkeypatch, duel_env, db_conn):
+    """The cap is PER USER now — a duel opened in channel 500 blocks the SAME user in
+    channel 600 too (the old per-channel escape hatch is gone)."""
     monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["50"]})
     _zh_ready(db_conn)
-    _log_duel_open(db_conn, 50, 500)  # used channel 500 today
-    i = _interaction(_member(50, role_ids=()), channel_id=600)  # different channel
+    _log_duel_open(db_conn, 50, 500)  # used a duel in the last 24h (channel 500)
+    i = _interaction(_member(50, role_ids=()), channel_id=600)  # different channel, same user
     await mod._handle_duel(i)
-    i.channel.send.assert_called_once()  # channel 600 is free
+    i.channel.send.assert_not_called()  # per-user cap spans channels
+    assert "in the last 24 hours" in _sent_text(i)
 
 
-async def test_yesterdays_open_does_not_count(monkeypatch, duel_env, db_conn):
+async def test_open_over_24h_ago_does_not_count(monkeypatch, duel_env, db_conn):
+    """The window is ROLLING 24h: an open older than 24h no longer counts."""
     monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["50"]})
     _zh_ready(db_conn)
     _log_duel_open(db_conn, 50, 500, ts="2020-01-01 00:00:00")  # ancient
     i = _interaction(_member(50, role_ids=()), channel_id=500)
     await mod._handle_duel(i)
-    i.channel.send.assert_called_once()  # only TODAY's opens count
+    i.channel.send.assert_called_once()  # only the last 24h counts
+
+
+async def test_open_25h_ago_frees_the_cap(monkeypatch, duel_env, db_conn):
+    """Rolling-window boundary: an open 25h ago is outside the window → a new duel posts."""
+    import datetime as _dt
+    monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["50"]})
+    _zh_ready(db_conn)
+    ts = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=25)).strftime("%Y-%m-%d %H:%M:%S")
+    _log_duel_open(db_conn, 50, 500, ts=ts)
+    i = _interaction(_member(50, role_ids=()), channel_id=500)
+    await mod._handle_duel(i)
+    i.channel.send.assert_called_once()
 
 
 async def test_arf_unlimited_bypasses_the_cap(monkeypatch, duel_env, db_conn):
-    """Arf (on duel_unlimited_starters) can open even after a same-channel open today."""
+    """Arf (on duel_unlimited_starters) can open even after an open in the last 24h."""
     monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["402620324744790017"]})
     _set_unlimited(db_conn, ["402620324744790017"])
     _seed_pending(db_conn, 1, kind="community_tweet", payload=_ct_payload(author="a"))
     _seed_pending(db_conn, 2, kind="community_tweet", payload=_ct_payload(author="b"))
-    _log_duel_open(db_conn, 402620324744790017, 500)  # already one today
+    _log_duel_open(db_conn, 402620324744790017, 500)  # already one in the last 24h
     i = _interaction(_member(402620324744790017, role_ids=()), channel_id=500)
     await mod._handle_duel(i)
     i.channel.send.assert_called_once()  # no cap for the unlimited allowlist
 
 
-async def test_open_lock_is_per_channel(monkeypatch, duel_env, db_conn):
-    """A live duel in channel 500 doesn't block a duel in channel 600 (per-channel lock)."""
-    monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["402620324744790017"]})
-    _set_unlimited(db_conn, ["402620324744790017"])  # unlimited so the daily cap is irrelevant
+async def test_double_click_guard_is_per_user_not_channel(monkeypatch, duel_env, db_conn):
+    """The anti-double-click reservation is keyed by USER: it refuses the same user's rapid
+    re-submit, but a DIFFERENT user in the same channel is unaffected."""
+    monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["402620324744790017", "77"]})
+    _set_unlimited(db_conn, ["402620324744790017"])  # unlimited so the 24h cap is irrelevant
     _seed_pending(db_conn, 1, kind="community_tweet", payload=_ct_payload(author="a"))
     _seed_pending(db_conn, 2, kind="community_tweet", payload=_ct_payload(author="b"))
     import time as _t
-    mod._OPEN_DUELS["500"] = _t.monotonic() + 600  # channel 500 has a live duel
-    i = _interaction(_member(402620324744790017, role_ids=()), channel_id=600)
+    mod._OPEN_DUELS["402620324744790017"] = _t.monotonic() + 600  # Arf's reservation is held
+    i = _interaction(_member(402620324744790017, role_ids=()), channel_id=500)
     await mod._handle_duel(i)
-    i.channel.send.assert_called_once()  # 600 is free
-    # but the SAME channel with a live duel is refused
-    j = _interaction(_member(402620324744790017, role_ids=()), channel_id=500)
+    i.channel.send.assert_not_called()  # Arf's own rapid re-submit is refused
+    assert "still posting" in _sent_text(i)
+    # a different user in the SAME channel is not blocked by Arf's reservation
+    j = _interaction(_member(77, role_ids=()), channel_id=500)
     await mod._handle_duel(j)
-    assert "already open in this channel" in _sent_text(j)
+    j.channel.send.assert_called_once()
 
 
 # --- generalized per-channel content profiles (duel_channels) -----------------
