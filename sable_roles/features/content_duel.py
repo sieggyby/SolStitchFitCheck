@@ -118,6 +118,12 @@ _KINDS_REFUSED = object()
 # X handle shape — a community card whose author_handle doesn't match is DROPPED
 # (a malformed handle would render as a fake attribution in a recognition game).
 _AUTHOR_HANDLE_RE = re.compile(r"^[A-Za-z0-9_]{1,15}$")
+# A community card's image (a meme tweet's photo). Host-LOCKED to X's public media CDN and
+# https-only — the ONLY image url we'll hand Discord to embed. A payload image_url that
+# doesn't match is dropped (never render an attacker-chosen host into a client channel).
+_IMAGE_URL_RE = re.compile(
+    r"^https://pbs\.twimg\.com/[\w./-]+\.(?:jpg|jpeg|png|webp)(?:[:?][\w=&%.\-]*)?$", re.I
+)
 # The reveal's ground-truth counters. Views deliberately excluded (retroactively
 # unreliable — same call as the ingest-side ranking).
 _ENGAGEMENT_KEYS = ("likes", "retweets", "replies", "quotes")
@@ -430,6 +436,8 @@ def _normalize_profile(raw) -> dict:
     label = raw.get("label")
     if isinstance(label, str) and label.strip():
         prof["label"] = label.strip()[:40]
+    if raw.get("require_image") is True:
+        prof["require_image"] = True  # a meme channel: only image-bearing community cards
     return prof
 
 
@@ -507,6 +515,11 @@ def _community_fields(payload_json: str) -> dict | None:
     xid = p.get("x_id")
     if isinstance(xid, str) and xid.isdigit() and len(xid) <= 25:
         fields["x_id"] = xid
+    # the meme-tweet image (host-locked pbs.twimg.com). Optional — a card without one (or
+    # with a non-matching url) is just text-rendered, never dropped for lack of an image.
+    img = p.get("image_url")
+    if isinstance(img, str) and _IMAGE_URL_RE.match(img):
+        fields["image_url"] = img
     return fields
 
 
@@ -645,6 +658,30 @@ def _duel_embed(org: str, card_a: dict, card_b: dict, *, votes: int, closed: boo
     return embed
 
 
+def _image_embed(card: dict, tag: str) -> discord.Embed:
+    """A stacked image embed for a meme-tweet card — Discord renders one large image per
+    embed, so an image duel is the text embed + one image embed per card that has one. The
+    url is the host-locked pbs.twimg.com value validated in _community_fields; Discord fetches
+    and re-hosts it through its own image proxy (survives message edits at close)."""
+    e = discord.Embed(color=discord.Color.from_str("#C8A86E"))
+    e.set_author(name=f"{tag} · @{card['author']}" if card.get("author") else tag)
+    e.set_image(url=card["image_url"])
+    return e
+
+
+def _duel_embeds(org: str, card_a: dict, card_b: dict, *, votes: int,
+                 closed: bool = False, tally: tuple[int, int] | None = None) -> list:
+    """The message's embed list: the text/tally embed, then a stacked image embed for each
+    card that carries one (a text-only duel is a single-element list, byte-identical to the
+    pre-image behavior). Discord allows up to 10 embeds per message; we use at most 3."""
+    embeds = [_duel_embed(org, card_a, card_b, votes=votes, closed=closed, tally=tally)]
+    if card_a.get("image_url"):
+        embeds.append(_image_embed(card_a, "🅰"))
+    if card_b.get("image_url"):
+        embeds.append(_image_embed(card_b, "🅱"))
+    return embeds
+
+
 # Same-tick double-click guard: a stateless persistent view can't see an in-flight sibling
 # click, and the durable has_recent_duel_vote can't see an UNCOMMITTED one — so a (message,
 # user) that's mid-write is held here for the ms it takes to commit. Cross-restart re-votes
@@ -745,7 +782,7 @@ class _DuelView(discord.ui.View):
             org, card_a, card_b, count = outcome
             # refresh the BLIND count for everyone (edits the shared message, no herding)
             await interaction.response.edit_message(
-                embed=_duel_embed(org, card_a, card_b, votes=count), view=self,
+                embeds=_duel_embeds(org, card_a, card_b, votes=count), view=self,
                 allowed_mentions=_NO_MENTIONS,
             )
 
@@ -815,7 +852,7 @@ async def _close_one(client: discord.Client, duel: dict) -> None:
     va, vb = await asyncio.to_thread(
         _tally_sync, org, int(card_a["id"]), int(card_b["id"]), duel["opened_at"]
     )
-    embed = _duel_embed(org, card_a, card_b, votes=va + vb, closed=True, tally=(va, vb))
+    embeds = _duel_embeds(org, card_a, card_b, votes=va + vb, closed=True, tally=(va, vb))
     view = _DuelView()
     for c in view.children:
         if isinstance(c, discord.ui.Button):
@@ -825,7 +862,7 @@ async def _close_one(client: discord.Client, duel: dict) -> None:
         if channel is None:
             channel = await client.fetch_channel(int(duel["channel_id"]))
         msg = await channel.fetch_message(int(mid))
-        await msg.edit(embed=embed, view=view, allowed_mentions=_NO_MENTIONS)
+        await msg.edit(embeds=embeds, view=view, allowed_mentions=_NO_MENTIONS)
     except discord.HTTPException as exc:
         # the row is already 'closed'; a deleted message / kicked bot just means no visible
         # reveal (never retried — the re-claim would fail anyway). Votes are already saved.
@@ -872,7 +909,8 @@ def _record_open_duel(message_id: str, org: str, guild_id: str, channel_id: str,
 
 def _load_pair(org: str, kinds: tuple[str, ...] | None = None,
                lang: str | None = None,
-               require_terms: tuple[str, ...] | None = None) -> list[dict]:
+               require_terms: tuple[str, ...] | None = None,
+               require_image: bool = False) -> list[dict]:
     """Two fresh pending candidates for a duel (empty/short list when the deck is thin).
     A candidate whose payload doesn't pass the strict public-render whitelist (F1)
     renders "" and is DROPPED — internal payload fields never reach the channel. A
@@ -881,7 +919,7 @@ def _load_pair(org: str, kinds: tuple[str, ...] | None = None,
     ``kinds``/``lang``/``require_terms`` are the per-channel content-profile filters (the
     default lang bucket ALSO admits untagged cards so nothing is silently lost)."""
     with get_db() as conn:
-        if kinds is None and lang is None and require_terms is None:
+        if kinds is None and lang is None and require_terms is None and not require_image:
             # MIXED-VERSION SAFETY (audit F1): the unconfigured path stays
             # byte-identical to the pre-filter call — a stale baked SablePlatform
             # in the Docker image (old signature) can never TypeError this path into
@@ -897,6 +935,8 @@ def _load_pair(org: str, kinds: tuple[str, ...] | None = None,
                 kw["include_untagged_lang"] = (lang == _DEFAULT_LANG)
             if require_terms is not None:
                 kw["require_terms"] = tuple(require_terms)
+            if require_image:
+                kw["require_image"] = True
             rows = cd_db.get_deck_duel_pair(conn, org, **kw)
     cards: list[dict] = []
     for r in rows:
@@ -908,7 +948,8 @@ def _load_pair(org: str, kinds: tuple[str, ...] | None = None,
             if extra is None:
                 continue  # bad author/engagement — never render, never reveal wrong
             card.update(extra)
-        if card["text"].strip():
+        # keep a card with text OR an image — a pure image meme (no caption) is valid content
+        if card["text"].strip() or card.get("image_url"):
             cards.append(card)
     return cards
 
@@ -1024,8 +1065,9 @@ async def _handle_duel(interaction: discord.Interaction) -> None:
     eff_kinds = profile.get("kinds") or kinds  # channel narrows the org's duel_kinds
     lang = profile.get("lang")
     terms = profile.get("require_terms")
+    need_image = bool(profile.get("require_image"))  # a meme channel serves image tweets only
     try:
-        pair = await asyncio.to_thread(_load_pair, org, eff_kinds, lang, terms)
+        pair = await asyncio.to_thread(_load_pair, org, eff_kinds, lang, terms, need_image)
     except Exception as exc:  # noqa: BLE001
         logger.warning("duel pair load failed for %s: %s", org, exc)
         pair = []
@@ -1063,7 +1105,7 @@ async def _handle_duel(interaction: discord.Interaction) -> None:
     _OPEN_DUELS[user_key] = time.monotonic() + _DOUBLE_CLICK_GUARD_SECONDS
     try:
         message = await channel.send(
-            embed=_duel_embed(org, card_a, card_b, votes=0), view=view,
+            embeds=_duel_embeds(org, card_a, card_b, votes=0), view=view,
             allowed_mentions=_NO_MENTIONS,
         )
     except discord.HTTPException:

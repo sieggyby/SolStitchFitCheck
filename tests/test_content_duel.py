@@ -288,7 +288,7 @@ async def test_duel_posts_public_embed_with_disclosure(duel_env):
     # the duel itself is a REGULAR bot channel message (webhook tokens die at 15 min);
     # the interaction response is just an ephemeral ack to the triggering mod.
     kwargs = i.channel.send.call_args.kwargs
-    embed = kwargs["embed"]
+    embed = kwargs["embeds"][0]
     assert "your vote is recorded" in embed.footer.text  # member-facing disclosure
     assert isinstance(kwargs["view"], mod._DuelView)
     assert kwargs["allowed_mentions"] is not None
@@ -354,14 +354,14 @@ async def test_failed_write_never_counts_the_vote(monkeypatch, duel_env):
 async def test_open_tally_is_blind_and_close_reveals(duel_env):
     mid = await _open_duel(duel_env)
     v = await _cast(duel_env, _member(10, role_ids=()), "a", mid)
-    open_embed = v.response.edit_message.call_args.kwargs["embed"]
+    open_embed = v.response.edit_message.call_args.kwargs["embeds"][0]
     open_text = " ".join(f"{f.name} {f.value}" for f in open_embed.fields)
     assert "votes 1" in open_text and "🅰 1" not in open_text  # count only, no split
 
     edited = MagicMock(spec=discord.Message)
     edited.edit = AsyncMock()
     await _close(duel_env, _fake_client(edited), mid)
-    closed_embed = edited.edit.call_args.kwargs["embed"]
+    closed_embed = edited.edit.call_args.kwargs["embeds"][0]
     closed_text = " ".join(f"{f.name} {f.value}" for f in closed_embed.fields)
     assert "🅰 1 — 0 🅱" in closed_text and "🅰 wins" in closed_text
     view = edited.edit.call_args.kwargs["view"]
@@ -629,12 +629,12 @@ async def _closed_embed(duel_env, mid):
     edited = MagicMock(spec=discord.Message)
     edited.edit = AsyncMock()
     await _close(duel_env, _fake_client(edited), mid)
-    return edited.edit.call_args.kwargs["embed"]
+    return edited.edit.call_args.kwargs["embeds"][0]
 
 
 async def test_community_cards_render_author_and_variant_footer(duel_env):
     mid, kwargs = await _open_community_duel(duel_env)
-    embed = kwargs["embed"]
+    embed = kwargs["embeds"][0]
     f_a, f_b = embed.fields[0], embed.fields[1]
     assert f_a.name.startswith("🅰 · @") and f_b.name.startswith("🅱 · @")
     assert {f_a.name.split("@")[1], f_b.name.split("@")[1]} == {"gabbyvorbeck", "syebastian"}
@@ -644,7 +644,7 @@ async def test_community_cards_render_author_and_variant_footer(duel_env):
     assert embed.fields[2].name == "votes" and embed.fields[2].value == "0"
     assert all(f.name != "reality" for f in embed.fields)
     v = await _cast(duel_env, _member(10, role_ids=()), "a", mid)
-    open_embed = v.response.edit_message.call_args.kwargs["embed"]
+    open_embed = v.response.edit_message.call_args.kwargs["embeds"][0]
     open_text = " ".join(f"{f.name} {f.value}" for f in open_embed.fields)
     assert "votes 1" in open_text
     assert "reality" not in open_text and "popped" not in open_text
@@ -811,7 +811,7 @@ async def test_cards_render_side_by_side_and_link_on_open_and_close(monkeypatch,
     _seed_pending(duel_env, 2, kind="community_tweet", payload=_ct_payload(author="syebastian"))
     i = _interaction(_member(402620324744790017, role_ids=()))
     await mod._handle_duel(i)
-    open_embed = i.channel.send.call_args.kwargs["embed"]
+    open_embed = i.channel.send.call_args.kwargs["embeds"][0]
 
     card_fields = [f for f in open_embed.fields if f.name.startswith(("🅰", "🅱"))]
     assert len(card_fields) == 2 and all(f.inline for f in card_fields)
@@ -1014,7 +1014,7 @@ async def test_duel_in_zh_channel_serves_zh_cards(monkeypatch, duel_env, db_conn
     i = _interaction(_member(1, role_ids=()), channel_id=777)
     await mod._handle_duel(i)
     i.channel.send.assert_called_once()
-    embed = i.channel.send.call_args.kwargs["embed"]
+    embed = i.channel.send.call_args.kwargs["embeds"][0]
     authors = {f.name.split("@")[1] for f in embed.fields if "@" in f.name}
     assert authors <= {"zhone", "zhtwo"}  # ONLY zh authors, never en
 
@@ -1042,7 +1042,7 @@ async def test_unmapped_channel_serves_default_not_zh(monkeypatch, duel_env, db_
     i = _interaction(_member(1, role_ids=()), channel_id=999)  # unmapped → default 'en'
     await mod._handle_duel(i)
     i.channel.send.assert_called_once()
-    embed = i.channel.send.call_args.kwargs["embed"]
+    embed = i.channel.send.call_args.kwargs["embeds"][0]
     authors = {f.name.split("@")[1] for f in embed.fields if "@" in f.name}
     assert authors <= {"enone", "entwo"}  # zh cards stay in their channel
 
@@ -1215,7 +1215,7 @@ async def test_prometheus_channel_serves_only_prometheus(monkeypatch, duel_env, 
     i = _interaction(_member(1, role_ids=()), channel_id=700)
     await mod._handle_duel(i)
     i.channel.send.assert_called_once()
-    authors = {f.name.split("@")[1] for f in i.channel.send.call_args.kwargs["embed"].fields if "@" in f.name}
+    authors = {f.name.split("@")[1] for f in i.channel.send.call_args.kwargs["embeds"][0].fields if "@" in f.name}
     assert authors <= {"pa", "pb"}  # never the off-topic card
 
 
@@ -1288,7 +1288,7 @@ async def test_startup_sweep_closes_a_duel_that_expired_during_downtime(duel_env
     edited = MagicMock(spec=discord.Message); edited.edit = AsyncMock()
     await mod._close_one(_fake_client(edited), due[0])
     assert edited.edit.called
-    closed = edited.edit.call_args.kwargs["embed"]
+    closed = edited.edit.call_args.kwargs["embeds"][0]
     assert any("🅰 1 — 0 🅱" in f.value for f in closed.fields)  # revealed the real tally
     assert mod.cduels.get_duel(duel_env, mid)["status"] == "closed"
 
@@ -1481,3 +1481,90 @@ async def test_allowed_channels_reader_unit(duel_env, db_conn):
     db_conn.execute("UPDATE orgs SET config_json=? WHERE org_id='solstitch'", (json.dumps(cfg),))
     db_conn.commit()
     assert mod._allowed_channels("solstitch") is None
+
+
+# --- meme-tweet images (image_url render + require_image routing) --------------
+
+_PBS = "https://pbs.twimg.com/media/GVLOrdDXMAAuHHz.jpg"
+
+
+def _img_payload(author, *, text_="meme tweet", img=_PBS, xid="1938291000000000001",
+                 engagement=None):
+    p = {"text": text_, "author_handle": author, "author_name": author,
+         "x_id": xid, "url": f"https://x.com/{author}/status/{xid}",
+         "engagement": engagement or {"likes": 10, "retweets": 2, "replies": 1, "quotes": 0},
+         "engagement_as_of": "2026-07-07T18:00:00Z", "lang": "en"}
+    if img is not None:
+        p["image_url"] = img
+    return json.dumps(p)
+
+
+def test_community_fields_extracts_valid_pbs_image():
+    f = mod._community_fields(_img_payload("alice"))
+    assert f["image_url"] == _PBS
+
+
+def test_community_fields_rejects_foreign_image_host():
+    f = mod._community_fields(_img_payload("alice", img="https://evil.example.com/x.jpg"))
+    assert "image_url" not in f  # host-locked to pbs.twimg.com — never embed an attacker host
+
+
+def test_community_fields_rejects_non_https_image():
+    f = mod._community_fields(_img_payload("alice", img="http://pbs.twimg.com/media/x.jpg"))
+    assert "image_url" not in f  # https-only
+
+
+def test_duel_embeds_stacks_one_image_embed_per_image_card():
+    ca = {"id": 1, "kind": "community_tweet", "text": "a", "author": "alice", "image_url": _PBS}
+    cb = {"id": 2, "kind": "community_tweet", "text": "b", "author": "bob"}  # no image
+    embeds = mod._duel_embeds("tig", ca, cb, votes=0)
+    assert len(embeds) == 2                      # main + one image (only A has one)
+    assert embeds[1].image.url == _PBS
+    assert "@alice" in embeds[1].author.name and embeds[1].author.name.startswith("🅰")
+
+
+def test_duel_embeds_text_only_is_single_embed():
+    ca = {"id": 1, "kind": "community_tweet", "text": "a", "author": "alice"}
+    cb = {"id": 2, "kind": "community_tweet", "text": "b", "author": "bob"}
+    assert len(mod._duel_embeds("tig", ca, cb, votes=0)) == 1  # unchanged from pre-image
+
+
+def test_duel_embeds_both_images_three_embeds():
+    ca = {"id": 1, "kind": "community_tweet", "text": "a", "author": "alice", "image_url": _PBS}
+    cb = {"id": 2, "kind": "community_tweet", "text": "b", "author": "bob", "image_url": _PBS}
+    embeds = mod._duel_embeds("tig", ca, cb, votes=0)
+    assert len(embeds) == 3 and embeds[1].image.url == _PBS and embeds[2].image.url == _PBS
+
+
+async def test_image_only_meme_card_is_served(duel_env, db_conn):
+    """A community tweet with NO caption but a valid image is kept (a pure image meme)."""
+    _sign_disclosure(db_conn)
+    _set_duel_kinds(db_conn, '["community_tweet"]')
+    _seed_pending(db_conn, 1, kind="community_tweet",
+                  payload=_img_payload("alice", text_="", xid="1000000000000000001"))
+    _seed_pending(db_conn, 2, kind="community_tweet",
+                  payload=_img_payload("bob", text_="", xid="1000000000000000002"))
+    cards = mod._load_pair("solstitch")
+    assert len(cards) == 2 and all(c.get("image_url") == _PBS for c in cards)
+
+
+def test_normalize_profile_accepts_require_image():
+    assert mod._normalize_profile({"require_image": True, "label": "memes"}) == {
+        "require_image": True, "label": "memes"}
+    assert "require_image" not in mod._normalize_profile({"require_image": "yes"})  # strict bool
+
+
+async def test_posted_image_duel_sends_three_embeds(monkeypatch, duel_env, db_conn):
+    """End-to-end: an image pair posts a message with the text embed + two image embeds."""
+    monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["50"]})
+    _sign_disclosure(db_conn)
+    _set_duel_kinds(db_conn, '["community_tweet"]')
+    _seed_pending(db_conn, 1, kind="community_tweet",
+                  payload=_img_payload("alice", xid="1000000000000000001"))
+    _seed_pending(db_conn, 2, kind="community_tweet",
+                  payload=_img_payload("bob", xid="1000000000000000002"))
+    i = _interaction(_member(50, role_ids=()), channel_id=500)
+    await mod._handle_duel(i)
+    embeds = i.channel.send.call_args.kwargs["embeds"]
+    assert len(embeds) == 3
+    assert {embeds[1].image.url, embeds[2].image.url} == {_PBS}
