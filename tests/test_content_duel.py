@@ -788,9 +788,9 @@ def _cards_from_embed(embed):
     return {f.name: f for f in embed.fields}
 
 
-async def test_cards_render_side_by_side_and_links_only_at_close(monkeypatch, duel_env):
-    """Cards are inline (desktop columns). The x.com permalink appears ONLY in the
-    closed embed — a link during the open vote leaks the real counts (the answer)."""
+async def test_cards_render_side_by_side_and_link_on_open_and_close(monkeypatch, duel_env):
+    """Cards are inline (desktop columns). The x.com permalinks appear on BOTH the open
+    and closed embeds (members can read/verify the real tweets during the vote)."""
     monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["402620324744790017"]})
     _sign_disclosure(duel_env)
     _set_duel_kinds(duel_env, '["community_tweet"]')
@@ -802,14 +802,18 @@ async def test_cards_render_side_by_side_and_links_only_at_close(monkeypatch, du
 
     card_fields = [f for f in open_embed.fields if f.name.startswith(("🅰", "🅱"))]
     assert len(card_fields) == 2 and all(f.inline for f in card_fields)
-    # answer-leak guard: NO tweet link anywhere while the vote is open
-    assert "x.com" not in str(open_embed.to_dict())
+    # links now appear DURING the vote (legitimacy over guessing-game purity)
+    open_links = next(f for f in open_embed.fields if f.name == "the tweets")
+    assert "https://x.com/gabbyvorbeck/status/1938291000000000000" in open_links.value
+    assert "https://x.com/syebastian/status/1938291000000000000" in open_links.value
+    # the open embed stays BLIND on the tally (count only, no split/reality)
+    assert any(f.name == "votes" for f in open_embed.fields)
+    assert all(f.name != "reality" for f in open_embed.fields)
 
     ca, cb = _served_cards(duel_env, i.channel.send.return_value.id)
     closed = mod._duel_embed("solstitch", ca, cb, votes=1, closed=True, tally=(1, 0))
     links = next(f for f in closed.fields if f.name == "the tweets")
     assert "https://x.com/gabbyvorbeck/status/1938291000000000000" in links.value
-    assert "https://x.com/syebastian/status/1938291000000000000" in links.value
 
 
 def test_tweet_render_unescapes_entities_and_keeps_line_breaks():
@@ -1271,3 +1275,96 @@ async def test_reveal_edit_failure_still_marks_closed(duel_env):
     client.get_channel = MagicMock(return_value=channel)
     await mod._close_one(client, duel)
     assert mod.cduels.get_duel(duel_env, mid)["status"] == "closed"
+
+
+# --- per-user channel restriction (duel_starter_channels) ---------------------
+
+def _set_starter_channels(conn, chmap, org="solstitch"):
+    cfg = json.loads(conn.execute("SELECT config_json FROM orgs WHERE org_id=?", (org,)).fetchone()[0])
+    cfg["duel_starter_channels"] = json.dumps(chmap)
+    conn.execute("UPDATE orgs SET config_json=? WHERE org_id=?", (json.dumps(cfg), org))
+    conn.commit()
+
+
+async def test_channel_restricted_user_only_starts_in_their_channel(monkeypatch, duel_env, db_conn):
+    """A user in duel_starter_channels may start ONLY in their listed channels — even though
+    they're an allowed starter — and is refused everywhere else."""
+    monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["55"]})  # 55 is an env starter
+    _sign_disclosure(db_conn)
+    _set_duel_kinds(db_conn, '["community_tweet"]')
+    _set_starter_channels(db_conn, {"55": ["700"]})  # restricted to channel 700
+    _seed_pending(db_conn, 1, kind="community_tweet", payload=_ct_payload(author="a"))
+    _seed_pending(db_conn, 2, kind="community_tweet", payload=_ct_payload(author="b"))
+
+    # in their channel → allowed
+    ok = _interaction(_member(55, role_ids=()), channel_id=700)
+    await mod._handle_duel(ok)
+    ok.channel.send.assert_called_once()
+
+    # a different channel → refused (despite being an env starter)
+    no = _interaction(_member(55, role_ids=()), channel_id=999)
+    await mod._handle_duel(no)
+    no.channel.send.assert_not_called()
+    assert "channels you're set up for" in _sent_text(no)
+
+
+async def test_unrestricted_starter_unaffected_by_others_restrictions(monkeypatch, duel_env, db_conn):
+    """A restriction on one user never constrains another (the map is per-user)."""
+    monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["55", "66"]})
+    _sign_disclosure(db_conn)
+    _set_duel_kinds(db_conn, '["community_tweet"]')
+    _set_starter_channels(db_conn, {"55": ["700"]})  # only 55 is restricted
+    _seed_pending(db_conn, 1, kind="community_tweet", payload=_ct_payload(author="a"))
+    _seed_pending(db_conn, 2, kind="community_tweet", payload=_ct_payload(author="b"))
+    i = _interaction(_member(66, role_ids=()), channel_id=999)  # 66 unrestricted
+    await mod._handle_duel(i)
+    i.channel.send.assert_called_once()
+
+
+async def test_can_start_duel_channel_gate_unit():
+    import sable_roles.features.content_duel as d
+    # patch the config reader to return a fixed restriction map
+    orig = d._starter_channels
+    d._starter_channels = lambda org: {"55": ["700"]}
+    d.DUEL_STARTERS.clear(); d.DUEL_STARTERS["100"] = ["55", "66"]
+    try:
+        m55 = _member(55, role_ids=())
+        assert d._can_start_duel(m55, "100", "solstitch", 700) is True    # allowed channel
+        assert d._can_start_duel(m55, "100", "solstitch", 999) is False   # wrong channel
+        m66 = _member(66, role_ids=())
+        assert d._can_start_duel(m66, "100", "solstitch", 999) is True    # unrestricted
+    finally:
+        d._starter_channels = orig
+        d.DUEL_STARTERS.clear()
+
+
+async def test_duel_allow_with_channel_persists_restriction(duel_env, db_conn):
+    _sign_disclosure(db_conn)
+    admin = _member(1, role_ids=(), manage_guild=True)
+    target = _member(777, role_ids=())
+    chan = MagicMock(); chan.id = 700
+    i = _interaction(admin)
+    await mod._handle_starter_change(i, target, grant=True, channel=chan)
+    assert "777" in (json.loads(_config(db_conn)) or [])  # is a starter
+    chmap = mod._starter_channels("solstitch")
+    assert chmap.get("777") == ["700"]                    # restricted to 700
+    assert "restricted to" in _sent_text(i)
+    # granting again with NO channel clears the restriction
+    i2 = _interaction(admin)
+    await mod._handle_starter_change(i2, target, grant=True, channel=None)
+    assert "777" not in mod._starter_channels("solstitch")
+    assert "any channel" in _sent_text(i2)
+
+
+async def test_duel_revoke_clears_channel_restriction(duel_env, db_conn):
+    _sign_disclosure(db_conn)
+    _set_starter_channels(db_conn, {"777": ["700"]})
+    cfg = json.loads(db_conn.execute("SELECT config_json FROM orgs WHERE org_id='solstitch'").fetchone()[0])
+    cfg["duel_starters_extra"] = json.dumps(["777"])
+    db_conn.execute("UPDATE orgs SET config_json=? WHERE org_id='solstitch'", (json.dumps(cfg),))
+    db_conn.commit()
+    admin = _member(1, role_ids=(), manage_guild=True)
+    i = _interaction(admin)
+    await mod._handle_starter_change(i, _member(777, role_ids=()), grant=False)
+    assert "777" not in mod._starter_channels("solstitch")
+    assert "777" not in (json.loads(_config(db_conn)) or [])

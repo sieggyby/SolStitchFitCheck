@@ -145,6 +145,29 @@ def _org_for(guild_id: int | str | None) -> str | None:
 
 
 _STARTERS_KEY = "duel_starters_extra"
+# Optional per-user CHANNEL restriction overlay (orgs.config_json). Maps {user_id:
+# [channel_id,…]} — a user listed here may start duels ONLY in those channels (e.g. a
+# community member scoped to the Chinese channel). A user NOT in this map starts wherever
+# they otherwise could (env/extra/MOD_ROLES). Set via /duel-allow @user channel:#x.
+_STARTER_CHANNELS_KEY = "duel_starter_channels"
+
+
+def _starter_channels(org: str | None) -> dict:
+    """The per-user channel-restriction overlay ({user_id: [channel_id,…]}). FAIL-SAFE:
+    read/parse error → {} (no restrictions applied — never wrongly locks a starter out of
+    every channel on a broken read)."""
+    if org is None or get_org_config_value is None:
+        return {}
+    try:
+        with get_db() as conn:
+            val = get_org_config_value(conn, org, _STARTER_CHANNELS_KEY)
+        if isinstance(val, str):
+            val = json.loads(val)
+        if not isinstance(val, dict):
+            return {}
+        return {str(k): [str(c) for c in v] for k, v in val.items() if isinstance(v, list)}
+    except Exception:  # noqa: BLE001 — a broken read applies no restriction, never locks out
+        return {}
 
 
 def _extra_starters(org: str | None) -> set[str]:
@@ -168,12 +191,16 @@ def _extra_starters(org: str | None) -> set[str]:
         return set()
 
 
-def _can_start_duel(member: discord.Member, guild_id: str, org: str | None = None) -> bool:
-    """The /duel trigger gate. A mod-whitelisted user (``duel_starters_extra`` config,
-    via /duel-allow) can ALWAYS start — checked first, purely additive. Otherwise: when
-    the guild has a ``DUEL_STARTERS`` env entry, that NAMED user-id allowlist is the
-    trigger (roles ignored — "by username not by role"; an explicit empty list locks the
-    env path); an unconfigured guild falls back to the MOD_ROLES role gate."""
+def _can_start_duel(member: discord.Member, guild_id: str, org: str | None = None,
+                    channel_id: int | str | None = None) -> bool:
+    """The /duel trigger gate. First, the CHANNEL-restriction overlay: a user listed in
+    ``duel_starter_channels`` may only start in their allowed channels (elsewhere → refused,
+    regardless of how else they qualify). Then the base gate: a ``duel_starters_extra``
+    grantee can ALWAYS start (additive); else the guild's ``DUEL_STARTERS`` env allowlist
+    (roles ignored; explicit-empty locks it); else the MOD_ROLES fallback."""
+    restricted = _starter_channels(org).get(str(member.id))
+    if restricted is not None and str(channel_id) not in restricted:
+        return False  # channel-scoped user, outside their channels
     if str(member.id) in _extra_starters(org):
         return True
     if guild_id in DUEL_STARTERS:
@@ -555,6 +582,16 @@ def _duel_embed(org: str, card_a: dict, card_b: dict, *, votes: int, closed: boo
     else:
         # count only while open — the A/B split stays hidden so votes can't herd
         embed.add_field(name="votes", value=str(votes), inline=False)
+        # tweet permalinks so members can read/verify the real tweets during the vote.
+        # (Tradeoff: a curious voter can click through and see the live engagement — i.e.
+        # the "answer" — so this trades a little guessing-game purity for legitimacy.)
+        url_a, url_b = _tweet_url(card_a), _tweet_url(card_b)
+        if url_a and url_b:
+            embed.add_field(
+                name="the tweets",
+                value=f"[🅰 @{card_a['author']}]({url_a}) · [🅱 @{card_b['author']}]({url_b})",
+                inline=False,
+            )
     embed.set_footer(text=footer)
     return embed
 
@@ -854,11 +891,15 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         await _handle_tasteboard(interaction)
 
     @tree.command(name="duel-allow", description="Let a member start duels (mods only)")
-    @app_commands.describe(user="The member to allow to run /duel")
+    @app_commands.describe(
+        user="The member to allow to run /duel",
+        channel="Restrict them to THIS channel only (omit = any channel). Repeat to add more.",
+    )
     async def duel_allow(  # pragma: no cover — thin shell
-        interaction: discord.Interaction, user: discord.Member
+        interaction: discord.Interaction, user: discord.Member,
+        channel: discord.abc.GuildChannel | None = None,
     ) -> None:
-        await _handle_starter_change(interaction, user, grant=True)
+        await _handle_starter_change(interaction, user, grant=True, channel=channel)
 
     @tree.command(name="duel-revoke", description="Stop a member from starting duels (mods only)")
     @app_commands.describe(user="The member to stop from running /duel")
@@ -882,10 +923,11 @@ async def _handle_duel(interaction: discord.Interaction) -> None:
         return
     member = interaction.user
     if not isinstance(member, discord.Member) or not _can_start_duel(
-        member, str(interaction.guild_id), org
+        member, str(interaction.guild_id), org, interaction.channel_id
     ):
         await interaction.response.send_message(
-            "duels are started by the team — ask one of them to run one.",
+            "duels are started by the team — ask one of them to run one "
+            "(and only in the channels you're set up for).",
             ephemeral=True, allowed_mentions=_NO_MENTIONS,
         )
         return
@@ -1074,12 +1116,34 @@ async def _handle_tasteboard(interaction: discord.Interaction) -> None:
     )
 
 
+def _as_list(raw) -> list:
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (ValueError, TypeError):
+            raw = []
+    return [str(x) for x in raw] if isinstance(raw, list) else []
+
+
+def _as_dict(raw) -> dict:
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (ValueError, TypeError):
+            raw = {}
+    return {str(k): [str(c) for c in v] for k, v in raw.items()
+            if isinstance(v, list)} if isinstance(raw, dict) else {}
+
+
 async def _handle_starter_change(
-    interaction: discord.Interaction, user: discord.Member, *, grant: bool
+    interaction: discord.Interaction, user: discord.Member, *, grant: bool,
+    channel: "discord.abc.GuildChannel | None" = None,
 ) -> None:
     """/duel-allow + /duel-revoke — a mod adds/removes a member from the config-backed
-    duel-starter allowlist (``orgs.config_json.duel_starters_extra``). Env-seeded
-    starters are managed out-of-band and can't be revoked here (reported when tried)."""
+    duel-starter allowlist (``duel_starters_extra``), optionally CHANNEL-SCOPED via
+    ``duel_starter_channels`` when a channel is given (they can then start only there;
+    repeat to add more channels; grant with no channel clears the restriction). Env-seeded
+    starters can't be fully revoked here (reported)."""
     org = _org_for(interaction.guild_id)
     if org is None or interaction.guild is None:
         await interaction.response.send_message(
@@ -1109,35 +1173,42 @@ async def _handle_starter_change(
         return
 
     uid = str(user.id)
+    channel_id = str(channel.id) if channel is not None else None
     env_seeded = uid in {str(s) for s in DUEL_STARTERS.get(str(interaction.guild_id), []) or []}
 
-    def _apply() -> str:
-        """Read-modify-write the config list on one connection. Returns an outcome tag."""
+    def _apply() -> tuple:
+        """Read-modify-write the starter list + channel map on one connection. Returns
+        (outcome_tag, channel_ids_for_user)."""
         with get_db() as conn:
-            raw = get_org_config_value(conn, org, _STARTERS_KEY)
-            current = []
-            if isinstance(raw, str):
-                try:
-                    raw = json.loads(raw)
-                except (ValueError, TypeError):
-                    raw = []
-            if isinstance(raw, list):
-                current = [str(x) for x in raw]
-            present = uid in current
+            current = _as_list(get_org_config_value(conn, org, _STARTERS_KEY))
+            chmap = _as_dict(get_org_config_value(conn, org, _STARTER_CHANNELS_KEY))
             if grant:
-                if present:
-                    return "already"
-                current.append(uid)
-            else:
-                if not present:
-                    return "absent"
-                current = [x for x in current if x != uid]
-            # store as a JSON string (set_org_config passes unknown keys through as-is)
+                if uid not in current:
+                    current.append(uid)
+                if channel_id is None:
+                    had = uid in chmap
+                    chmap.pop(uid, None)  # grant EVERYWHERE — clear any restriction
+                    tag = "granted_all" if had else "granted"
+                else:
+                    chans = chmap.get(uid, [])
+                    if channel_id not in chans:
+                        chans.append(channel_id)
+                    chmap[uid] = chans
+                    tag = "granted_channel"
+                set_org_config(conn, org, _STARTERS_KEY, json.dumps(current))
+                set_org_config(conn, org, _STARTER_CHANNELS_KEY, json.dumps(chmap))
+                return tag, chmap.get(uid, [])
+            # revoke — remove the extra grant + any channel restriction
+            if uid not in current and uid not in chmap:
+                return "absent", []
+            current = [x for x in current if x != uid]
+            chmap.pop(uid, None)
             set_org_config(conn, org, _STARTERS_KEY, json.dumps(current))
-            return "granted" if grant else "revoked"
+            set_org_config(conn, org, _STARTER_CHANNELS_KEY, json.dumps(chmap))
+            return "revoked", []
 
     try:
-        outcome = await asyncio.to_thread(_apply)
+        outcome, chans = await asyncio.to_thread(_apply)
     except Exception as exc:  # noqa: BLE001
         logger.warning("duel-starter change failed for %s/%s: %s", org, uid, exc)
         await interaction.response.send_message(
@@ -1147,13 +1218,17 @@ async def _handle_starter_change(
         return
 
     mention = f"<@{uid}>"
+    ch_list = " ".join(f"<#{c}>" for c in chans)
     if outcome == "granted":
-        msg = f"{mention} can now start duels."
+        msg = f"{mention} can now start duels in any channel."
+    elif outcome == "granted_all":
+        msg = f"{mention} can now start duels in any channel (channel restriction cleared)."
+    elif outcome == "granted_channel":
+        msg = f"{mention} can now start duels — restricted to: {ch_list}."
     elif outcome == "revoked":
-        msg = f"{mention} can no longer start duels."
-    elif outcome == "already":
-        extra = " (they're a team-seeded starter)" if env_seeded else ""
-        msg = f"{mention} could already start duels{extra}."
+        tail = (" They're a team-seeded starter, so they can still start via the team list."
+                if env_seeded else "")
+        msg = f"{mention} can no longer start duels (grant + any channel restriction cleared).{tail}"
     elif outcome == "absent":
         if env_seeded:
             msg = (f"{mention} is a team-seeded starter — that's set by the Sable team, "
@@ -1189,11 +1264,20 @@ async def _handle_list_starters(interaction: discord.Interaction) -> None:
     guild_id = str(interaction.guild_id)
     seeded = [str(s) for s in DUEL_STARTERS.get(guild_id, []) or []]
     extra = sorted(await asyncio.to_thread(_extra_starters, org))
+    chmap = await asyncio.to_thread(_starter_channels, org)
     lines = []
     if seeded:
         lines.append("**team-seeded:** " + " ".join(f"<@{u}>" for u in seeded))
     if extra:
         lines.append("**mod-added:** " + " ".join(f"<@{u}>" for u in extra))
+    if chmap:
+        # channel-scoped users: name each with the channels they're limited to
+        scoped = "\n".join(
+            f"  <@{u}> → " + " ".join(f"<#{c}>" for c in chans)
+            for u, chans in sorted(chmap.items()) if chans
+        )
+        if scoped:
+            lines.append("**channel-restricted:**\n" + scoped)
     if not lines:
         lines.append("no named starters — server mods start duels by role.")
     embed = discord.Embed(
