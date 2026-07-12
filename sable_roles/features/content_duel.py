@@ -33,6 +33,7 @@ import asyncio
 import html as _html
 import json
 import logging
+import math
 import re
 import time
 from datetime import datetime, timedelta, timezone
@@ -954,6 +955,222 @@ def _load_pair(org: str, kinds: tuple[str, ...] | None = None,
     return cards
 
 
+# --- community submission + the Signal Index ---------------------------------
+# A member on the ``duel_submitters`` allowlist (or any duel starter) may enter a tweet
+# into the arena via /duel-submit. A human picking a tweet IS the meme filter — if it
+# carries an image we trust it (no vision classifier needed). The submitter is credited
+# in content_candidates.source ('duel_submit:<uid>'); the Signal Index ranks submitters.
+_SUBMITTERS_KEY = "duel_submitters"
+_SUBMIT_SOURCE_PREFIX = "duel_submit:"
+_TWEET_URL_RE = re.compile(
+    r"https?://(?:www\.)?(?:x|twitter|fixupx|vxtwitter|fxtwitter)\.com/"
+    r"([A-Za-z0-9_]{1,15})/status/(\d{5,25})",
+    re.I,
+)
+
+
+def _duel_submitters(org: str | None) -> set[str]:
+    """The allowlist of members who may enter tweets via /duel-submit (config
+    ``duel_submitters``, a JSON list of user ids). FAIL-SAFE: any error → empty set."""
+    if org is None or get_org_config_value is None:
+        return set()
+    try:
+        with get_db() as conn:
+            val = get_org_config_value(conn, org, _SUBMITTERS_KEY)
+        if isinstance(val, str):
+            val = json.loads(val)
+        return {str(x) for x in val} if isinstance(val, list) else set()
+    except Exception:  # noqa: BLE001 — a broken read grants nobody, never security-relevant
+        return set()
+
+
+def _parse_tweet_url(url: str) -> tuple[str, str] | None:
+    """(handle, x_id) from a tweet URL, or None if it isn't one."""
+    m = _TWEET_URL_RE.search(url or "")
+    return (m.group(1), m.group(2)) if m else None
+
+
+def _popped_from_payload(payload: dict) -> int:
+    e = payload.get("engagement") or {}
+    return (int(e.get("likes", 0)) + 2 * int(e.get("retweets", 0))
+            + int(e.get("replies", 0)) + int(e.get("quotes", 0)))
+
+
+def _payload_from_raw(raw: dict, x_id: str, url_handle: str) -> dict | None:
+    """Build a community_tweet payload from a cached SocialData tweet dict. None when there's
+    nothing renderable (no text AND no valid image). A photo → image_url (trusted, human-
+    submitted): this is the FREE meme source."""
+    user = raw.get("user") if isinstance(raw.get("user"), dict) else {}
+    handle = user.get("screen_name") or url_handle
+    if not _AUTHOR_HANDLE_RE.fullmatch(str(handle)):
+        return None
+    text = raw.get("full_text") or raw.get("text") or ""
+    eng = {
+        "likes": int(raw.get("favorite_count", 0) or 0),
+        "retweets": int(raw.get("retweet_count", 0) or 0),
+        "replies": int(raw.get("reply_count", 0) or 0),
+        "quotes": int(raw.get("quote_count", 0) or 0),
+    }
+    media_node = raw.get("extended_entities") or raw.get("entities") or {}
+    media = media_node.get("media") if isinstance(media_node, dict) else None
+    img = None
+    if isinstance(media, list):
+        for m in media:
+            if isinstance(m, dict) and m.get("type") == "photo" and m.get("media_url_https"):
+                img = m["media_url_https"]
+                break
+    payload = {
+        "text": _html.unescape(str(text)), "author_handle": str(handle),
+        "author_name": user.get("name") or str(handle), "x_id": str(x_id),
+        "url": f"https://x.com/{handle}/status/{x_id}", "engagement": eng,
+        "engagement_as_of": _now_iso(), "lang": raw.get("lang") or "en",
+    }
+    if img and _IMAGE_URL_RE.match(img):
+        payload["image_url"] = img
+    if not payload["text"].strip() and "image_url" not in payload:
+        return None
+    return payload
+
+
+def _signal_index(submissions: int, entries: int, wins: int) -> int:
+    """The (deliberately opaque) Signal Index. Submitting earns a base; a submission the
+    community then rallies behind in duels multiplies it (bayesian win-rate × how many duels
+    it drew × how prolific the submitter is). The exact weighting is intentionally unadvertised."""
+    base = 12 * submissions
+    if entries <= 0:
+        return base
+    taste = (wins + 1) / (entries + 2)
+    return round(base + 140 * taste * math.sqrt(entries) * (1 + math.log1p(submissions)))
+
+
+def _submit_sync(org: str, x_id: str, url_handle: str, uid: str):
+    """Cache-first submission (worker thread). Reads the shared SocialData cache
+    (relay_tweets) — FREE. Returns an outcome tag: 'uncached' | 'unrenderable' | 'dup' |
+    'claimed' (credited an existing enriched card to the submitter) | 'added' | 'error'."""
+    try:
+        with get_db() as conn:
+            row = conn.execute(
+                "SELECT raw FROM relay_tweets WHERE x_id = :x LIMIT 1", {"x": str(x_id)}
+            ).fetchone()
+            if row is None or row[0] is None:
+                return ("uncached", None)
+            try:
+                raw = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+            except (ValueError, TypeError):
+                return ("uncached", None)
+            if not isinstance(raw, dict):
+                return ("uncached", None)
+            payload = _payload_from_raw(raw, str(x_id), url_handle)
+            if payload is None:
+                return ("unrenderable", None)
+            src = _SUBMIT_SOURCE_PREFIX + str(uid)
+            existing = conn.execute(
+                "SELECT id, source FROM content_candidates WHERE org_id = :o "
+                "AND kind = 'community_tweet' AND status = 'pending' "
+                "AND payload_json LIKE :pat ORDER BY id LIMIT 1",
+                {"o": org, "pat": f'%"x_id": "{x_id}"%'},
+            ).fetchone()
+            if existing is not None:
+                if str(existing[1]).startswith(_SUBMIT_SOURCE_PREFIX):
+                    return ("dup", payload)  # already in the arena as a submission
+                # credit the human + graft the image onto the auto-enriched card
+                conn.execute(
+                    "UPDATE content_candidates SET source = :s, payload_json = :p "
+                    "WHERE id = :id",
+                    {"s": src, "p": json.dumps(payload), "id": int(existing[0])},
+                )
+                conn.commit()
+                return ("claimed", payload)
+            cd_db.upsert_candidate(
+                conn, org_id=org, kind="community_tweet", payload_json=json.dumps(payload),
+                source=src, dedupe_key=f"ct:{x_id}", score=float(_popped_from_payload(payload)),
+            )
+            conn.commit()
+            return ("added", payload)
+    except Exception:  # noqa: BLE001 — a submission failure is a polite refusal, never a crash
+        logger.exception("duel submit failed for %s x_id=%s", org, x_id)
+        return ("error", None)
+
+
+async def _handle_duel_submit(interaction: discord.Interaction, url: str) -> None:
+    org = _org_for(interaction.guild_id)
+    member = interaction.user
+    if org is None or not isinstance(member, discord.Member):
+        await interaction.response.send_message(
+            "this server isn't set up for content duels.", ephemeral=True,
+            allowed_mentions=_NO_MENTIONS)
+        return
+    # gate: the submitter allowlist, OR anyone who can already start duels (starters submit too)
+    allowed = str(member.id) in _duel_submitters(org) or _can_start_duel(
+        member, str(interaction.guild_id), org, interaction.channel_id)
+    if not allowed:
+        await interaction.response.send_message(
+            "you're not on the duel-submission list yet — ask a mod to add you with "
+            "`/duel-allow` or the submitter list.", ephemeral=True, allowed_mentions=_NO_MENTIONS)
+        return
+    if not await asyncio.to_thread(_disclosure_signed, org):
+        await interaction.response.send_message(
+            "community duels aren't enabled for this server.", ephemeral=True,
+            allowed_mentions=_NO_MENTIONS)
+        return
+    parsed = _parse_tweet_url(url)
+    if parsed is None:
+        await interaction.response.send_message(
+            "that doesn't look like a tweet link — paste an `x.com/…/status/…` URL.",
+            ephemeral=True, allowed_mentions=_NO_MENTIONS)
+        return
+    handle, x_id = parsed
+    outcome, _payload = await asyncio.to_thread(_submit_sync, org, x_id, handle, str(member.id))
+    msgs = {
+        "added": "✅ entered the arena — your pick is in the pool. climb the **Signal Index** if it resonates.",
+        "claimed": "✅ entered the arena — that one's now credited to you on the **Signal Index**.",
+        "dup": "already in the arena — that tweet's been entered.",
+        "uncached": ("I can't pull that tweet's stats yet — it may be too new or not indexed. "
+                     "give it a day and retry, or submit one that's been making the rounds."),
+        "unrenderable": "I couldn't read that tweet (no text or image to show).",
+        "error": "something went wrong entering that one — try again in a moment.",
+    }
+    await interaction.response.send_message(
+        msgs.get(outcome, msgs["error"]), ephemeral=True, allowed_mentions=_NO_MENTIONS)
+
+
+def _submitter_board_sync(org: str) -> list[dict]:
+    with get_db() as conn:
+        return cd_db.get_duel_submitter_leaderboard(conn, org)
+
+
+async def _handle_signal_index(interaction: discord.Interaction) -> None:
+    org = _org_for(interaction.guild_id)
+    if org is None or interaction.guild is None:
+        await interaction.response.send_message(
+            "this server isn't set up for content duels.", ephemeral=True,
+            allowed_mentions=_NO_MENTIONS)
+        return
+    try:
+        rows = await asyncio.to_thread(_submitter_board_sync, org)
+    except Exception:  # noqa: BLE001
+        rows = []
+    ranked = sorted(
+        ({**r, "index": _signal_index(r["submissions"], r["entries"], r["wins"])} for r in rows),
+        key=lambda r: -r["index"])[:10]
+    if not ranked:
+        await interaction.response.send_message(
+            "the Index is empty — enter a tweet with `/duel-submit <link>` to get on the board.",
+            ephemeral=True, allowed_mentions=_NO_MENTIONS)
+        return
+    lines = []
+    for i, r in enumerate(ranked, start=1):
+        rank = {1: "🥇", 2: "🥈", 3: "🥉"}.get(i, f"`{i:>2}`")
+        lines.append(f"{rank} <@{r['submitter']}> · **σ {r['index']}**")
+    embed = discord.Embed(
+        title="🛰 The Signal Index",
+        description="\n".join(lines), color=discord.Color.from_str("#C8A86E"),
+    )
+    embed.set_footer(text="σ — derived from submission provenance, duel resonance & consensus weighting")
+    await interaction.response.send_message(
+        embed=embed, ephemeral=True, allowed_mentions=_NO_MENTIONS)
+
+
 def register_commands(tree: app_commands.CommandTree) -> None:
     """Register /duel + /tasteboard on the GLOBAL tree — main.py's copy_global_to loop
     fans them onto every GUILD_TO_ORG guild. Runtime gates (org mapping + mod trigger +
@@ -988,6 +1205,15 @@ def register_commands(tree: app_commands.CommandTree) -> None:
     @tree.command(name="duel-starters", description="Who can start duels here (mods only)")
     async def duel_starters(interaction: discord.Interaction) -> None:  # pragma: no cover
         await _handle_list_starters(interaction)
+
+    @tree.command(name="duel-submit", description="Enter a tweet into the duel arena")
+    @app_commands.describe(url="link to the tweet you want to enter")
+    async def duel_submit(interaction: discord.Interaction, url: str) -> None:  # pragma: no cover
+        await _handle_duel_submit(interaction, url)
+
+    @tree.command(name="signal-index", description="The Signal Index — top duel submitters")
+    async def signal_index(interaction: discord.Interaction) -> None:  # pragma: no cover
+        await _handle_signal_index(interaction)
 
 
 async def _handle_duel(interaction: discord.Interaction) -> None:

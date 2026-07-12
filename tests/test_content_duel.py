@@ -1568,3 +1568,132 @@ async def test_posted_image_duel_sends_three_embeds(monkeypatch, duel_env, db_co
     embeds = i.channel.send.call_args.kwargs["embeds"]
     assert len(embeds) == 3
     assert {embeds[1].image.url, embeds[2].image.url} == {_PBS}
+
+
+# --- community submission + the Signal Index ----------------------------------
+
+def _seed_relay(conn, x_id, handle, *, text_="a $tig meme", likes=10, rts=2, replies=1,
+                quotes=0, photo=None):
+    raw = {"full_text": text_, "lang": "en", "favorite_count": likes, "retweet_count": rts,
+           "reply_count": replies, "quote_count": quotes,
+           "user": {"screen_name": handle, "name": handle}}
+    if photo:
+        raw["extended_entities"] = {"media": [{"type": "photo", "media_url_https": photo}]}
+    conn.execute(
+        "INSERT INTO relay_tweets (x_id, x_author_handle, text, raw, source, fetched_at) "
+        "VALUES (?, ?, ?, ?, 'test', '2026-07-12T00:00:00Z')",
+        (str(x_id), handle, text_, json.dumps(raw)))
+    conn.commit()
+
+
+def _set_submitters(conn, uids, org="solstitch"):
+    cfg = json.loads(conn.execute("SELECT config_json FROM orgs WHERE org_id=?", (org,)).fetchone()[0])
+    cfg["duel_submitters"] = json.dumps([str(u) for u in uids])
+    conn.execute("UPDATE orgs SET config_json=? WHERE org_id=?", (json.dumps(cfg), org))
+    conn.commit()
+
+
+def test_parse_tweet_url():
+    assert mod._parse_tweet_url("https://x.com/gabby/status/1234567890") == ("gabby", "1234567890")
+    assert mod._parse_tweet_url("look https://twitter.com/a_b/status/1990000000000000009 !") == ("a_b", "1990000000000000009")
+    assert mod._parse_tweet_url("https://x.com/gabby") is None
+    assert mod._parse_tweet_url("nope") is None
+
+
+def test_payload_from_raw_with_and_without_image():
+    raw = {"full_text": "meme", "lang": "en", "favorite_count": 5, "retweet_count": 1,
+           "reply_count": 0, "quote_count": 0, "user": {"screen_name": "alice", "name": "Alice"},
+           "extended_entities": {"media": [{"type": "photo", "media_url_https": _PBS}]}}
+    p = mod._payload_from_raw(raw, "123", "alice")
+    assert p["image_url"] == _PBS and p["author_handle"] == "alice"
+    assert p["engagement"] == {"likes": 5, "retweets": 1, "replies": 0, "quotes": 0}
+    assert mod._payload_from_raw({"full_text": "", "user": {"screen_name": "a"}}, "1", "a") is None
+
+
+def test_signal_index_rewards_wins():
+    assert mod._signal_index(0, 0, 0) == 0
+    base = mod._signal_index(3, 0, 0)          # submitted 3, none dueled → base only
+    assert base == 36
+    assert mod._signal_index(3, 4, 4) > base    # winning duels multiplies
+
+
+async def test_duel_submit_cached_adds_credited_candidate(monkeypatch, duel_env, db_conn):
+    monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["50"]})  # 50 is a starter → may submit
+    _sign_disclosure(db_conn)
+    _seed_relay(db_conn, "1550000000000000001", "alice", photo=_PBS)
+    i = _interaction(_member(50, role_ids=()))
+    await mod._handle_duel_submit(i, "https://x.com/alice/status/1550000000000000001")
+    assert "arena" in _sent_text(i)
+    rows = db_conn.execute(
+        "SELECT source, payload_json FROM content_candidates WHERE kind='community_tweet'").fetchall()
+    match = [r for r in rows if json.loads(r[1]).get("x_id") == "1550000000000000001"]
+    assert match and match[0][0] == "duel_submit:50"
+    assert json.loads(match[0][1])["image_url"] == _PBS  # human-submitted image trusted (free meme)
+
+
+async def test_duel_submit_uncached_refused(monkeypatch, duel_env, db_conn):
+    monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["50"]})
+    _sign_disclosure(db_conn)
+    i = _interaction(_member(50, role_ids=()))
+    await mod._handle_duel_submit(i, "https://x.com/ghost/status/1990000000000000009")  # not cached
+    assert "can't pull" in _sent_text(i)
+    assert db_conn.execute("SELECT COUNT(*) FROM content_candidates").fetchone()[0] == 0
+
+
+async def test_duel_submit_allowlist_gate(monkeypatch, duel_env, db_conn):
+    monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["50"]})  # 60 is neither starter nor submitter
+    _sign_disclosure(db_conn)
+    _seed_relay(db_conn, "1550000000000000001", "alice")
+    i = _interaction(_member(60, role_ids=()))
+    await mod._handle_duel_submit(i, "https://x.com/alice/status/1550000000000000001")
+    assert "not on the duel-submission list" in _sent_text(i)
+    assert db_conn.execute("SELECT COUNT(*) FROM content_candidates").fetchone()[0] == 0
+
+
+async def test_duel_submit_submitter_allowlist_admits_non_starter(monkeypatch, duel_env, db_conn):
+    monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["50"]})
+    _sign_disclosure(db_conn)
+    _set_submitters(db_conn, ["60"])           # 60 explicitly allowed (not a starter)
+    _seed_relay(db_conn, "1550000000000000001", "alice")
+    i = _interaction(_member(60, role_ids=()))
+    await mod._handle_duel_submit(i, "https://x.com/alice/status/1550000000000000001")
+    assert "arena" in _sent_text(i)
+
+
+async def test_duel_submit_credits_existing_enriched_card(monkeypatch, duel_env, db_conn):
+    """Submitting a tweet that auto-enrichment already added transfers credit to the human
+    and grafts its image (no duplicate card)."""
+    monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["50"]})
+    _sign_disclosure(db_conn)
+    db_conn.execute(
+        "INSERT INTO content_candidates (id, org_id, kind, status, payload_json, source, created_at) "
+        "VALUES (900, 'solstitch', 'community_tweet', 'pending', ?, 'duel_enrich', '2026-07-02T00:00:00Z')",
+        (json.dumps({"x_id": "1550000000000000001", "text": "a $tig meme", "author_handle": "alice"}),))
+    db_conn.commit()
+    _seed_relay(db_conn, "1550000000000000001", "alice", photo=_PBS)
+    i = _interaction(_member(50, role_ids=()))
+    await mod._handle_duel_submit(i, "https://x.com/alice/status/1550000000000000001")
+    allc = db_conn.execute("SELECT source, payload_json FROM content_candidates "
+                           "WHERE kind='community_tweet'").fetchall()
+    rows = [r for r in allc if json.loads(r[1]).get("x_id") == "1550000000000000001"]
+    assert len(rows) == 1                        # no duplicate
+    assert rows[0][0] == "duel_submit:50"        # credited to the human
+    assert json.loads(rows[0][1])["image_url"] == _PBS
+
+
+async def test_signal_index_ranks_submitters(duel_env, db_conn):
+    _sign_disclosure(db_conn)
+    for cid, xid, src in ((900, "1", "duel_submit:60"), (901, "2", "seed")):
+        db_conn.execute(
+            "INSERT INTO content_candidates (id, org_id, kind, status, payload_json, source, created_at) "
+            "VALUES (?, 'solstitch', 'community_tweet', 'pending', ?, ?, '2026-07-02T00:00:00Z')",
+            (cid, json.dumps({"x_id": xid}), src))
+    db_conn.execute(
+        "INSERT INTO content_deck_decisions (org_id, actor, actor_kind, surface, decision, "
+        "candidate_id, pair_loser_id, created_at) "
+        "VALUES ('solstitch', 'discord:user:10', 'community', 'discord', 'keep', 900, 901, '2026-07-02T01:00:00Z')")
+    db_conn.commit()
+    i = _interaction(_member(1, role_ids=()))
+    await mod._handle_signal_index(i)
+    embed = i.response.send_message.call_args.kwargs["embed"]
+    assert "<@60>" in embed.description and "σ" in embed.description
