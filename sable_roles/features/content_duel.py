@@ -243,17 +243,47 @@ def _extra_starters(org: str | None) -> set[str]:
         return set()
 
 
+_STARTER_ROLES_KEY = "duel_starter_roles"
+
+
+def _starter_roles(org: str | None) -> set[str]:
+    """The ROLE-based duel-starter allowlist (``duel_starter_roles``, a JSON list of Discord
+    role ids). ANYONE holding one of these roles may start duels — so an operator manages
+    access by simply ASSIGNING a role, no per-user /duel-allow. Additive, like extra_starters.
+    FAIL-SAFE: any read/parse error → empty set (falls through to the base gate)."""
+    if org is None or get_org_config_value is None:
+        return set()
+    try:
+        with get_db() as conn:
+            val = get_org_config_value(conn, org, _STARTER_ROLES_KEY)
+        if isinstance(val, str):
+            val = json.loads(val)
+        return {str(x) for x in val} if isinstance(val, list) else set()
+    except Exception:  # noqa: BLE001 — a broken read never grants and never locks out
+        return set()
+
+
+def _member_has_starter_role(member: discord.Member, org: str | None) -> bool:
+    roles = _starter_roles(org)
+    if not roles:
+        return False
+    return any(str(getattr(r, "id", r)) in roles for r in getattr(member, "roles", []) or [])
+
+
 def _can_start_duel(member: discord.Member, guild_id: str, org: str | None = None,
                     channel_id: int | str | None = None) -> bool:
-    """The /duel trigger gate. First, the CHANNEL-restriction overlay: a user listed in
-    ``duel_starter_channels`` may only start in their allowed channels (elsewhere → refused,
-    regardless of how else they qualify). Then the base gate: a ``duel_starters_extra``
-    grantee can ALWAYS start (additive); else the guild's ``DUEL_STARTERS`` env allowlist
-    (roles ignored; explicit-empty locks it); else the MOD_ROLES fallback."""
+    """The /duel trigger gate. First, the per-user CHANNEL-restriction overlay: a user listed
+    in ``duel_starter_channels`` may only start in their allowed channels (elsewhere → refused,
+    regardless of how else they qualify). Then the base gate: a ``duel_starters_extra`` grantee
+    OR anyone holding a ``duel_starter_roles`` role can ALWAYS start (additive — assign the
+    role and you're in); else the guild's ``DUEL_STARTERS`` env allowlist (explicit-empty locks
+    it); else the MOD_ROLES fallback."""
     restricted = _starter_channels(org).get(str(member.id))
     if restricted is not None and str(channel_id) not in restricted:
         return False  # channel-scoped user, outside their channels
     if str(member.id) in _extra_starters(org):
+        return True
+    if _member_has_starter_role(member, org):  # role-based: assigning the role grants access
         return True
     if guild_id in DUEL_STARTERS:
         return str(member.id) in {str(s) for s in DUEL_STARTERS[guild_id] or []}
@@ -1206,6 +1236,15 @@ def register_commands(tree: app_commands.CommandTree) -> None:
     async def duel_starters(interaction: discord.Interaction) -> None:  # pragma: no cover
         await _handle_list_starters(interaction)
 
+    @tree.command(name="duel-role",
+                  description="Let everyone with a role start duels — assign the role to grant (mods only)")
+    @app_commands.describe(role="the role whose members may start duels",
+                           remove="remove this role from duel-starters instead of adding")
+    async def duel_role(  # pragma: no cover — thin shell
+        interaction: discord.Interaction, role: discord.Role, remove: bool = False,
+    ) -> None:
+        await _handle_role_change(interaction, role, grant=not remove)
+
     @tree.command(name="duel-submit", description="Enter a tweet into the duel arena")
     @app_commands.describe(url="link to the tweet you want to enter")
     async def duel_submit(interaction: discord.Interaction, url: str) -> None:  # pragma: no cover
@@ -1556,6 +1595,59 @@ async def _handle_starter_change(
     )
 
 
+async def _handle_role_change(interaction: discord.Interaction, role: discord.Role,
+                              *, grant: bool) -> None:
+    """/duel-role — add/remove a ROLE from ``duel_starter_roles``. After a role is added,
+    EVERY member holding it can start duels (assigning the role is the only ongoing step —
+    no per-user /duel-allow). Mod-gated (same as /duel-allow)."""
+    org = _org_for(interaction.guild_id)
+    if org is None or interaction.guild is None:
+        await interaction.response.send_message(
+            "this server isn't configured for content duels.", ephemeral=True,
+            allowed_mentions=_NO_MENTIONS)
+        return
+    actor = interaction.user
+    if not isinstance(actor, discord.Member) or not _can_manage_starters(
+        actor, str(interaction.guild_id)
+    ):
+        await interaction.response.send_message(
+            "you need Manage Server (or a mod role) to manage duel-starter roles.",
+            ephemeral=True, allowed_mentions=_NO_MENTIONS)
+        return
+
+    def _apply() -> str:
+        with get_db() as conn:
+            raw = get_org_config_value(conn, org, _STARTER_ROLES_KEY)
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw)
+                except (ValueError, TypeError):
+                    raw = None
+            current = {str(x) for x in raw} if isinstance(raw, list) else set()
+            rid = str(role.id)
+            if grant and rid in current:
+                return "already"
+            if not grant and rid not in current:
+                return "absent"
+            current.add(rid) if grant else current.discard(rid)
+            set_org_config(conn, org, _STARTER_ROLES_KEY, json.dumps(sorted(current)))
+            conn.commit()
+            return "granted" if grant else "revoked"
+
+    outcome = await asyncio.to_thread(_apply)
+    msgs = {
+        "granted": (f"✅ anyone with {role.mention} can now start duels — just assign the "
+                    "role. **Heads-up:** make sure that role also has Discord's **Use "
+                    "Application Commands** permission (Server Settings → Roles), or members "
+                    "still won't see the `/duel` command."),
+        "revoked": f"removed {role.mention} — its members can no longer start duels by role.",
+        "already": f"{role.mention} is already a duel-starter role.",
+        "absent": f"{role.mention} isn't a duel-starter role.",
+    }
+    await interaction.response.send_message(
+        msgs[outcome], ephemeral=True, allowed_mentions=_NO_MENTIONS)
+
+
 async def _handle_list_starters(interaction: discord.Interaction) -> None:
     """/duel-starters — show who can start duels here (team-seeded env list + the
     mod-granted config list), mention-rendered. Mod-gated (same as allow/revoke)."""
@@ -1580,12 +1672,16 @@ async def _handle_list_starters(interaction: discord.Interaction) -> None:
     extra = sorted(await asyncio.to_thread(_extra_starters, org))
     chmap = await asyncio.to_thread(_starter_channels, org)
     allowed = await asyncio.to_thread(_allowed_channels, org)
+    roles = sorted(await asyncio.to_thread(_starter_roles, org))
     lines = []
     if allowed is not None:
         lines.append("**duel channels:** " + " ".join(f"<#{c}>" for c in sorted(allowed))
                      + "  _(duels can only be started here)_")
     else:
         lines.append("**duel channels:** any channel _(no allowlist set)_")
+    if roles:
+        lines.append("**starter roles:** " + " ".join(f"<@&{r}>" for r in roles)
+                     + "  _(anyone with the role can start)_")
     if seeded:
         lines.append("**team-seeded:** " + " ".join(f"<@{u}>" for u in seeded))
     if extra:

@@ -1697,3 +1697,64 @@ async def test_signal_index_ranks_submitters(duel_env, db_conn):
     await mod._handle_signal_index(i)
     embed = i.response.send_message.call_args.kwargs["embed"]
     assert "<@60>" in embed.description and "σ" in embed.description
+
+
+# --- role-based starters (duel_starter_roles) ---------------------------------
+
+def _set_starter_roles(conn, role_ids, org="solstitch"):
+    cfg = json.loads(conn.execute("SELECT config_json FROM orgs WHERE org_id=?", (org,)).fetchone()[0])
+    cfg["duel_starter_roles"] = json.dumps([str(r) for r in role_ids])
+    conn.execute("UPDATE orgs SET config_json=? WHERE org_id=?", (json.dumps(cfg), org))
+    conn.commit()
+
+
+async def test_role_holder_can_start_by_role(monkeypatch, duel_env, db_conn):
+    """Anyone holding a duel_starter_roles role passes the gate — no per-user grant."""
+    monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["1"]})   # by-id list has only user 1
+    _set_starter_roles(db_conn, ["777"])
+    holder = _member(50, role_ids=(777,))                       # not id-listed, but has role 777
+    assert mod._can_start_duel(holder, "100", "solstitch", 500) is True
+    other = _member(51, role_ids=(888,))                        # no starter role, not id-listed
+    assert mod._can_start_duel(other, "100", "solstitch", 500) is False
+
+
+async def test_role_starter_posts_duel_end_to_end(monkeypatch, duel_env, db_conn):
+    monkeypatch.setattr(mod, "DUEL_STARTERS", {"100": ["1"]})
+    _sign_disclosure(db_conn)
+    _set_duel_kinds(db_conn, '["community_tweet"]')
+    _seed_pending(db_conn, 1, kind="community_tweet", payload=_ct_payload(author="a"))
+    _seed_pending(db_conn, 2, kind="community_tweet", payload=_ct_payload(author="b"))
+    _set_starter_roles(db_conn, ["777"])
+    i = _interaction(_member(50, role_ids=(777,)), channel_id=500)
+    await mod._handle_duel(i)
+    i.channel.send.assert_called_once()
+
+
+async def test_duel_role_grant_and_revoke(duel_env, db_conn):
+    admin = _member(1, role_ids=(), manage_guild=True)
+    role = MagicMock(); role.id = 777; role.mention = "<@&777>"
+    i = _interaction(admin)
+    await mod._handle_role_change(i, role, grant=True)
+    assert mod._starter_roles("solstitch") == {"777"}
+    assert "can now start duels" in _sent_text(i)
+    assert "Use Application Commands" in _sent_text(i)   # reminds about the Discord perm layer
+    i2 = _interaction(admin)
+    await mod._handle_role_change(i2, role, grant=False)
+    assert mod._starter_roles("solstitch") == set()
+    assert "can no longer start" in _sent_text(i2)
+
+
+async def test_duel_role_requires_manage_server(duel_env, db_conn):
+    role = MagicMock(); role.id = 777; role.mention = "<@&777>"
+    i = _interaction(_member(50, role_ids=()))              # not a mod, no manage_guild
+    await mod._handle_role_change(i, role, grant=True)
+    assert "need Manage Server" in _sent_text(i)
+    assert mod._starter_roles("solstitch") == set()
+
+
+async def test_duel_starters_lists_starter_roles(duel_env, db_conn):
+    _set_starter_roles(db_conn, ["777"])
+    i = _interaction(_member(1, role_ids=(), manage_guild=True))
+    await mod._handle_list_starters(i)
+    desc = i.response.send_message.call_args.kwargs["embed"].description
+    assert "<@&777>" in desc and "starter roles" in desc
