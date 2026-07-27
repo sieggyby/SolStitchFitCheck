@@ -12,7 +12,10 @@
 ##         -t stitzy:latest \
 ##         .
 ##
-## Runtime env (set via /opt/sable-web/.env + docker-compose.override.yml):
+## Runtime env — secrets from the box's gitignored /opt/sable-web/.env, wired in by
+## SableWeb's TRACKED docker-compose.prod-override.yml (the box's
+## docker-compose.override.yml is a symlink to it as of 2026-07-26 — edit the tracked
+## file and pull, never edit the override on the box):
 ##   SABLE_ROLES_DISCORD_TOKEN          (required) Discord bot token
 ##   SABLE_ROLES_FITCHECK_CHANNELS_JSON (required) per-guild fitcheck routing
 ##   SABLE_ROLES_GUILD_TO_ORG_JSON      (required) guild -> SP org mapping
