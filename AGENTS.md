@@ -17,7 +17,9 @@ The one dependency that genuinely matters for understanding the code is **SableP
 A dedicated Discord bot for **Sable's community-role automation across client servers**. V1 ships fit-check streak tracking + image-only enforcement for SolStitch's `#fitcheck`. V2 adds the burn-me + roast + vibe + airlock + scored-mode stack. Future features (e.g. `@influenza` monthly rotation, role-tier grants tied to points) plug into the same bot process.
 
 **Repo root:** `~/Projects/sable-roles/`
-**Status:** V1 live in SolStitch since 2026-05-13; V2 burn-me + roast + vibe + airlock shipped on Hetzner VPS 2026-05-16 (per `project_stitzy_vps_deployed`). Scored Mode V2 (Pass A+B+C) lives on branch `scored-mode-pass-ab`, default `state='off'` so the deploy ships invisible until a mod flips per-guild.
+**Status:** V1 live in SolStitch since 2026-05-13; V2 burn-me + roast + vibe + airlock shipped on Hetzner VPS 2026-05-16 (per `project_stitzy_vps_deployed`). Scored Mode V2 (Pass A+B+C+D) is present on `origin/main`, default `state='off'`; per-guild activation remains an operator decision.
+
+**Repository status (2026-09-07, local source + Git verification):** `origin/main` contains per-guild sync hardening (`c51f549`, 2026-07-03) in [SableRolesClient.setup_hook](sable_roles/main.py) and persistent duels with a durable close scheduler (`16ddb20`, 2026-07-11) in [content_duel.py](sable_roles/features/content_duel.py). These are completed implementations, not branch gaps. This check establishes repository contents, not current deployment or live-guild configuration. Dated snapshots below retain the earlier rollout record.
 
 **Build plan (source of truth):** `~/Projects/SolStitch/internal/fitcheck_v1_build_plan.md`
 **Chunked build TODO + audit history:** `~/Projects/SolStitch/internal/fitcheck_build_TODO.md` (C1-C9 all `[x]`)
@@ -36,7 +38,8 @@ SableRolesClient(discord.Client)        sable_roles/main.py
     ├─ setup_hook
     │   • register feature handlers (fitcheck_streak.register)
     │   • register slash commands (fitcheck_streak.register_commands → /streak)
-    │   • per-guild copy_global_to + tree.sync from GUILD_TO_ORG
+    │   • per-guild copy_global_to + tree.sync from GUILD_TO_ORG (HTTP failures log + skip)
+    │   • duel feature: content_duel.register → persistent view + durable close loop
     ├─ on_ready  (logs "sable-roles connected as <bot_user> · fitcheck streak active",
     │             warns on 24h-empty discord_streak_events)
     └─ close()   (drains in-flight reaction-recompute debounce tasks before super().close())
@@ -110,7 +113,7 @@ Each `_recompute_after_delay` captures `self_task = asyncio.current_task()` at e
 `SableRolesClient.close()` calls `fitcheck_streak.close()` BEFORE `super().close()`. `fitcheck_streak.close()` cancels all pending tasks then awaits them with `return_exceptions=True`. Without this drain, `super().close()` tears down the event loop while debounce tasks still hold open handles → `Task was destroyed but it is pending!` warnings on shutdown.
 
 **`setup_hook`, not `on_ready`, hosts slash-command sync:**
-`on_ready` can fire multiple times on gateway reconnect, which would re-sync commands and trip Discord rate limits. `setup_hook` runs once before login (matches SableTracking precedent). Per-guild registration uses `copy_global_to(guild=...)` + `await tree.sync(guild=...)` for instant per-guild availability vs the 1-hour global propagation window.
+`on_ready` can fire multiple times on gateway reconnect, which would re-sync commands and trip Discord rate limits. `setup_hook` runs during login before gateway events. Per-guild registration uses `copy_global_to(guild=...)` + `await tree.sync(guild=...)` for instant per-guild availability vs the 1-hour global propagation window. Both the live-guild loop and the content-deck test-guild loop catch `discord.HTTPException`, log the failure, and continue in [sable_roles/main.py](sable_roles/main.py). Completed in `c51f549` (2026-07-03); regression coverage: [test_setup_hook_sync_hardening.py](tests/test_setup_hook_sync_hardening.py).
 
 **Image detection — content_type first, extension fallback:**
 `is_image(att)` returns True if `att.content_type.startswith("image/")` AND `content_type != "image/svg+xml"` (SVG excluded — Discord doesn't render + sandbox risk). Falls back to extension allowlist (`.png/.jpg/.jpeg/.gif/.webp/.heic/.heif/.avif/.bmp`) when content_type is missing/generic (e.g. `application/octet-stream`). Extension is spoofable — accepted for V1; document the spoof risk in any future hardening review.
@@ -144,7 +147,7 @@ Bot deletes any text-only post, including from `@Atelier` (admins). Discord role
 
 ---
 
-### Scored Mode V2 (Pass A+B+C; branch `scored-mode-pass-ab`, default `state='off'`)
+### Scored Mode V2 (Pass A+B+C on `origin/main`, default `state='off'`)
 
 **Default state `'off'` is triple-guarded.** SQL `DEFAULT 'off'` on `discord_scoring_config.state` (migration 051), `get_config` returns `state='off'` when no row exists, and `scoring_pipeline.maybe_score_fit` short-circuits BEFORE any Anthropic call when state is `'off'`. Tests assert each layer (`tests/db/test_discord_scoring_config.py` + `test_scoring_pipeline.py::test_state_off_blocks_all_scoring_no_api_no_db_write`). NO file in either repo flips state to `silent` or `revealed` at init time — operator must `/scoring set` explicitly.
 
@@ -164,7 +167,7 @@ Bot deletes any text-only post, including from `@Atelier` (admins). Discord role
 
 **Tone band is audit-only.** Reveal reply text uses display_name with NO @-ping. Tone band (`high` ≥80 / `mid` 40-79 / `low` <40) shifts warmth, not voice. The `caught:` line is included ONLY when `catch_detected` is non-null. The other 3 axis rationales live in `axis_rationales_json` on the score row but are NOT surfaced in the reveal — mods pull them from audit if needed.
 
-**Leaderboard query contract (Pass D — future).** The `reveal_fired_at` column is the one-and-done lock for FOUR distinct trigger states: `reactions` and `thread_messages` (real reveals) plus `cancelled_deleted` and `publish_failed` (terminal failure locks). Pass D leaderboard queries MUST filter `reveal_trigger IN ('reactions','thread_messages')` to exclude failure-lock rows. Contract spelled out in `discord_fitcheck_scores.py` module docstring + plan §6.4 + §9.2.
+**Leaderboard query contract (Pass D — implemented in `sable_roles/features/leaderboard.py`).** The `reveal_fired_at` column is the one-and-done lock for FOUR distinct trigger states: `reactions` and `thread_messages` (real reveals) plus `cancelled_deleted` and `publish_failed` (terminal failure locks). Pass D leaderboard queries MUST filter `reveal_trigger IN ('reactions','thread_messages')` to exclude failure-lock rows. Contract spelled out in `discord_fitcheck_scores.py` module docstring + plan §6.4 + §9.2.
 
 **Prompt caching is mandatory.** `scoring_pipeline` uses Anthropic's `cache_control: ephemeral` on the rubric system block. Per the `claude-api` memory: any Claude SDK call must use prompt caching. Tests assert `cache_control` is set on the system payload (`test_scoring_pipeline.py::test_anthropic_call_uses_cache_control_on_system_block`).
 
@@ -172,7 +175,7 @@ Bot deletes any text-only post, including from `@Atelier` (admins). Discord role
 
 ---
 
-### State Pin (branch `state-pin`, default-invisible)
+### State Pin (on `origin/main`, default-invisible)
 
 **One-line:** when a mod changes any Stitzy-managed state dimension (scoring / burn_mode / relax_mode / personalize_mode) AND the new state differs from the old, the bot posts a system-voice state-summary message in the per-guild ops channel and pins it, unpinning any prior pin for the same dimension. #sable-ops's pinned-message list becomes a live dashboard of current bot state.
 
@@ -208,11 +211,21 @@ Bot deletes any text-only post, including from `@Atelier` (admins). Discord role
 
 **THE DISCLOSURE GATE (fail-closed — the consent boundary):** every command re-checks `orgs.config_json.pairwise_disclosure_signed` AT INVOCATION via `get_org_config_value` (defensive import — an old SablePlatform fails the gate closed, never boot-crashes the bot). Non-empty NON-SENTINEL string required (`"false"`/`"no"`/`"revoked"`/`"off"`/`"0"`… refuse — `_REVOKED_SENTINELS`); any error refuses. Member-facing disclosure rides every duel embed footer. Registration is NOT authorization: `/duel`+`/tasteboard` are GLOBAL-tree commands fanned onto GUILD_TO_ORG guilds (the OPPOSITE posture from the content_deck Phase-0 spike, which stays test-only + untouched) — an unsigned org gets a polite refusal.
 
-**Vote integrity:** the repo's FIRST non-author-locked View. One vote per member enforced twice — a SYNCHRONOUS pre-mark in the View dict BEFORE any await (discord.py dispatches each click as its own task; the pre-mark closes the double-click race the durable guard can't see mid-transaction; rolled back on write failure) + the durable `has_recent_duel_vote` DB guard (survives restarts). Blind count-only tally while open (no herding); A/B split reveals at close. HARD 10-min wall-clock deadline (`_DUEL_OPEN_SECONDS` + a monotonic `_deadline`; `View.timeout` alone is a refreshable INACTIVITY timer — after each vote it is shrunk to the remaining wall-clock). Vote DB work runs via `asyncio.to_thread` (the gateway event loop never stalls on Postgres). One open duel per org (`_OPEN_DUELS`, in-process — single-process constraint; cleared `.clear()`-style in tests). The duel posts as a REGULAR bot channel message (interaction webhook tokens expire at 15 min — an interaction-owned message could not be edited at close). Strict public-render whitelist: ONLY `payload.text` / `[format] captions` ever reach the channel — an unrecognized payload renders "" and the candidate is dropped (guardrail_hits / internal fields never post). `AllowedMentions.none()` on every send/edit.
+**Vote integrity (current source):** [sable_roles/features/content_duel.py](sable_roles/features/content_duel.py) uses a stateless persistent `_DuelView` (`timeout=None`, static button IDs `duel:vote:a` / `duel:vote:b`). `_record_vote` looks up the SablePlatform `content_duels` row by message ID, refuses closed or past-deadline votes, and checks `has_recent_duel_vote`. `_VOTING` pre-marks each (message, user) while the worker-thread write is in flight and releases it in `finally`. The open tally stays blind; closing reads the durable vote ledger. Duels have a stored 24-hour UTC deadline. Starts use a per-user rolling 24-hour limit (with configured exemptions) plus a 30-second in-memory double-click reservation in `_OPEN_DUELS`; there is no one-open-duel-per-org/channel lock in current source. Messages are regular bot channel messages, and sends/edits suppress mentions. Supported community-tweet images are embedded through `_duel_embeds` / `_image_embed` with a `pbs.twimg.com` host allowlist.
 
 **The quarantine (SP side):** votes land as `content_deck_decisions` rows (`actor_kind='community'`, `surface='discord'`, `decision='keep'` + `pair_loser_id`) and fold into `community:`-prefixed `content_quality` rows at BOTH grains — no operator-Elo consumer (deck ranking, meme template loop, text format tilt, keep-rate, hard-negatives) reads prefixed keys. Promotion past the quarantine is gated on the masterplan §11 K-tests, a deliberate future change.
 
+**Durable lifecycle (implemented `16ddb20`, 2026-07-11):** `content_duel.register` registers the persistent view with `client.add_view` and starts `_close_loop`, a 60-second sweep of due `content_duels` rows. Its first pass after gateway readiness handles duels that expired during downtime. `_close_one` claims the close before tallying and editing the message. [SableRolesClient.setup_hook / close](sable_roles/main.py) wire `content_duel.register` / `content_duel.stop_tasks` under `feature_enabled("duel")`. Tests in [tests/test_content_duel.py](tests/test_content_duel.py) cover static IDs, voting through a fresh view, startup expiry, durable dedup, and single-flight close.
+
+**Current limits:** persistence requires the SablePlatform `content_duels` helpers and migration 084. A missing/failed registry write leaves no row for `_record_vote` or the close sweep. A reveal edit failure after the close claim is logged and not retried; the votes remain saved. In-flight vote/start guards remain process-local. New-org activation still requires guild mapping, feature configuration and signed disclosure; local Git does not establish live activation.
+
+<!-- historical-status:start -->
+**Historical Phase-5 launch snapshot (2026-07-02; superseded by the current lifecycle above):**
+
+**Vote integrity:** the repo's FIRST non-author-locked View. One vote per member enforced twice — a SYNCHRONOUS pre-mark in the View dict BEFORE any await (discord.py dispatches each click as its own task; the pre-mark closes the double-click race the durable guard can't see mid-transaction; rolled back on write failure) + the durable `has_recent_duel_vote` DB guard (survives restarts). Blind count-only tally while open (no herding); A/B split reveals at close. HARD 10-min wall-clock deadline (`_DUEL_OPEN_SECONDS` + a monotonic `_deadline`; `View.timeout` alone is a refreshable INACTIVITY timer — after each vote it is shrunk to the remaining wall-clock). Vote DB work runs via `asyncio.to_thread` (the gateway event loop never stalls on Postgres). One open duel per org (`_OPEN_DUELS`, in-process — single-process constraint; cleared `.clear()`-style in tests). The duel posts as a REGULAR bot channel message (interaction webhook tokens expire at 15 min — an interaction-owned message could not be edited at close). Strict public-render whitelist: ONLY `payload.text` / `[format] captions` ever reach the channel — an unrecognized payload renders "" and the candidate is dropped (guardrail_hits / internal fields never post). `AllowedMentions.none()` on every send/edit.
+
 **Known limits (documented, accepted for v1):** views are non-persistent — a bot restart orphans an open duel's buttons ("interaction failed"; the vote ledger survives, the tally never reveals); the org lock is in-process; candidate images aren't embedded (pending candidates have no R2 ref — needs a render endpoint). Activation for a NEW org = bot in guild + GUILD_TO_ORG entry + `sable-platform org config set <org> pairwise_disclosure_signed "<date + who + authority>"`. TIG is prepped but NOT active (needs the guild invite + client confirmation). Record: `~/sable-workspace/CONTENT_DECK_PHASE5_SHIPPED.md`. Tests: `tests/test_content_duel.py` (20).
+<!-- historical-status:end -->
 
 ---
 
@@ -243,7 +256,7 @@ Bot deletes any text-only post, including from `@Atelier` (admins). Discord role
 - 76 tests passing (`tests/test_image_detection.py`, `tests/test_dm_bank.py`, `tests/test_dm_cooldown.py`, `tests/test_reaction_recompute.py`, `tests/test_debounce_race.py`, `tests/test_handler_resilience.py`, `tests/test_unconfigured_guild.py`, `tests/test_format_streak.py`). Plus 19 SablePlatform tests at `~/Projects/SablePlatform/tests/db/test_discord_streaks.py`.
 - Live in SolStitch (guild `1501026101730869290`, `#fitcheck` channel `1501073373252292709`) since 2026-05-13.
 
-**Scored Mode V2 (Pass A+B+C — on branch `scored-mode-pass-ab`, default `state='off'`, ships invisible):**
+**Scored Mode V2 (Pass A+B+C+D — on `origin/main`, default `state='off'`):**
 
 - `features/image_hashing.py` — pHash compute on every counted fit + 90d collision detection. Emits `fitcheck_image_phash_recorded` / `fitcheck_image_phash_failed` (INFO) / `fitcheck_repost_detected` (LOW) / `fitcheck_image_theft_detected` (HIGH). Runs regardless of scoring state.
 - `features/delete_monitor.py` — `on_raw_message_delete` severity classifier (LOW / MEDIUM / CRITICAL per design §7.2) + `on_raw_message_edit` text-edit audit (lengths only, never content). REPLACE binder. Runs regardless of scoring state.
@@ -251,25 +264,31 @@ Bot deletes any text-only post, including from `@Atelier` (admins). Discord role
 - `features/reveal_pipeline.py` — debounced per-post recompute, per-emoji unique-reactor counts, milestone audits (5/8/10 reactions), low-age reactor audit (<30d account), CAS-locked reveal-fire with tone-banded plain-text reply (no @-ping), 404-during-publish → cancelled_deleted HIGH audit, 5xx → publish_failed HIGH audit. Gated on `state='revealed'` AND `posted_at >= state_changed_at` (silent-period posts never reveal).
 - `prompts/scoring_system.py` — rubric_v1 system prompt (Cohesion · Execution · Concept · Catch axes, Bollin-calibrated).
 - Default state `'off'` triple-guarded (DEFAULT + helper + pipeline gate). Pass A audit/detection rows still land on `off` state — only Pass B (scoring) + Pass C (reveal) bail.
+- `sable_roles/features/leaderboard.py` — Pass D `/leaderboard`, registered by `SableRolesClient.setup_hook` when the fitcheck feature is enabled. Two boards, ephemeral by default, optional public output and 30-day window, per-user cooldown. Coverage: `tests/test_leaderboard.py`.
+- Sync hardening and durable duels are complete on `origin/main`; see `c51f549` / `16ddb20` and the current implementation links above.
+
+<!-- historical-status:start -->
+**Historical Pass A+B+C snapshot (2026-05-16; branch/PR/test/activation statements below describe that snapshot, not current status):**
+
 - Branch state: 4 commits on sable-roles (`b57463b` scaffold → `010c002` tests+QA → `d5295c7` Pass C → `221f8eb` §8.3 strict), 2 commits on SablePlatform (`fb8dc8f` migs 049-051 → `eecbb90` mig 052). PRs sieggyby/SolStitchFitCheck#1 + sieggyby/SablePlatform#1 OPEN.
 - Test suites: sable-roles 512 passed (`+88` scored-mode); SablePlatform 1529 passed / 3 skipped (`+115` scored-mode).
 - NOT yet flipped on any live guild — `/scoring set silent` must be run manually after deploy per design §10 phasing.
+<!-- historical-status:end -->
 
 ---
 
 ## What's not built yet
 
-1. **VPS deployment** — runs on Sieggy's local machine via `python -m sable_roles.main`. Target: Hetzner VPS within 24-48h of go-live (per build plan §6). See `OPERATIONS_RUNBOOK.md` §6.
-2. **`tree.sync` try/except in `setup_hook`** (`main.py:47`) — hardening pass before any second-guild onboarding. Currently a Forbidden on one guild crashes the whole bot.
+Completed items removed from this implementation backlog: VPS deployment (recorded 2026-05-16 below), per-guild sync hardening (`c51f549`), Pass D (`sable_roles/features/leaderboard.py`), and durable duels (`16ddb20`). Original item numbers are retained for cross-reference.
+
 3. **Operator allowlist for `#fitcheck` enforcement** — Brian (admin) gets deleted same as anyone. Config-driven user_id list to bypass delete+DM.
 4. **`@influenza` rotation feature** — same bot host. Monthly top-N yappers via SableTracking listener data → role grant/revoke. Memory: `project_solstitch_influenza`.
 5. **Backfill admin CLI** — V1 starts streaks at gateway-connect; no history import. Defer until asked.
 6. **Health/status surfacing** — V1 logs to stdout only. `#sable-ops` health-ping deliberately removed (plan round-3 audit — bot has no channel overwrite). When deployed: pull stdout from journalctl/compose logs; consider a `/sable-roles-status` slash command or a SablePlatform alert on `discord_streak_events.created_at` staleness.
-7. **Tier-weighted reactions, public leaderboard, freeze policy, thread-reply scoring, squads, streak-tier roles, AI-gen detection** — all deferred to V2 per plan §8.
+7. **Tier-weighted reactions, freeze policy, thread-reply scoring, squads, streak-tier roles, AI-gen detection** — all deferred to V2 per plan §8.
 
-**Scored Mode V2 deferred (post-Pass-C):**
+**Scored Mode V2 remaining follow-ups:**
 
-8. **Pass D — `/leaderboard`** — two boards (Top Revealed Fits + Best Per User), revealed-only, ephemeral default with `public:true` opt-in, per-guild, rate-limited 1/user/min. Gated on ≥10 revealed fits + ≥2 weeks in Revealed mode + Brian sign-off (design §10.2 / §10.6). The query contract `reveal_trigger IN ('reactions','thread_messages')` is already documented (see `discord_fitcheck_scores.py` module docstring) so Pass D can lift it directly.
 9. **`/scoring config` mod command** — edit thresholds + model in DB without redeploy. V1 hardcodes plan §6.3 defaults.
 10. **`/scoring suspicious` mod-review surface** — show HIGH/CRITICAL audit rows from last 30d with jump-links. Premature UX until real suspect rows exist.
 11. **Cross-guild image hash collision** — current pHash collision query is scoped to `org_id`. Multi-guild SolStitch needs cross-guild query.
@@ -288,7 +307,7 @@ See `~/Projects/SolStitch/internal/fitcheck_build_TODO.md` for chunk-level minor
 
 ## Secrets & credentials
 
-**GitHub status:** not pushed to a remote yet — repo is local-only at time of writing. `.env` is gitignored (`.gitignore` excludes `.env`). No secrets in source.
+**GitHub status:** this checkout has `origin/main`; the source and cited Git objects above are present locally. `.env` is gitignored (`.gitignore` excludes `.env`). No secrets in source.
 
 **What's in `.env` (live credentials on local disk):**
 - `SABLE_ROLES_DISCORD_TOKEN` — Discord bot token for the `Sable Roles` app (application_id `1504314425581244548`). Resets via developer portal Bot → Reset Token if leaked.
@@ -318,11 +337,11 @@ See `~/Projects/SolStitch/internal/fitcheck_build_TODO.md` for chunk-level minor
 *(Add entries here when a plan is agreed but not yet implemented)*
 
 - ~~**Item 1 — VPS deploy.**~~ DONE 2026-05-16 (per `project_stitzy_vps_deployed`). Hetzner host runs the V2 stack via docker compose; SablePlatform Postgres lives on the same host.
-- **Item 2 — `setup_hook` try/except hardening.** Wrap `tree.sync(guild=...)` in `try/except discord.HTTPException` per SableTracking `bot.py:31-34` precedent. One bad guild_id should log + skip, not crash the whole process. Trivially a one-block edit.
+- ~~**Item 2 — `setup_hook` try/except hardening.**~~ DONE 2026-07-03 (`c51f549`). Both sync loops in [sable_roles/main.py](sable_roles/main.py) log + skip `discord.HTTPException`; covered by `tests/test_setup_hook_sync_hardening.py`.
 - **Item 3 — Operator allowlist.** Add `SABLE_ROLES_FITCHECK_ALLOWLIST_JSON` env var (shape: `{"<guild_id>": ["<user_id>", ...]}`). On image-less message in fit-check channel, check allowlist first — if member, skip delete+DM but still audit-log `allowlist_skipped` for traceability. ~10 LOC.
-- **Item 4 — Scored Mode V2 Phase 0 → Phase 1 (Off → Silent).** Pass A+B+C shipped on branch `scored-mode-pass-ab`. Gate to flip: merge both PRs, deploy to VPS, smoke test per `scored_mode_pass_ab_qa_log.md` runbook on Sieggy's test guild, then `/scoring set silent` on a live guild. Default deploy = `off`, no behavior change.
+- **Item 4 — Scored Mode V2 Phase 0 → Phase 1 (Off → Silent), operator rollout.** Pass A+B+C is on `origin/main`; no branch merge or implementation remains for it here. Retain the smoke-test and per-guild activation gates in `scored_mode_pass_ab_qa_log.md`; inspect live state before any rollout action. Default state is `off`.
 - **Item 5 — Scored Mode V2 Phase 1 → Phase 2 (Silent → Revealed).** Gated on ≥20 scored fits + ≥7d silent data + ≥5 active posters in #fitcheck during silent + Sieggy spot-check ≥10 + vision API failure rate <5% + Brian sign-off on sample reveals. Pure ops decision, no code change required.
-- **Item 6 — Scored Mode V2 Phase 2 → Phase 3 (Pass D leaderboard).** Build + ship Pass D once ≥10 revealed fits exist + ≥2 weeks Revealed mode + Brian sign-off on opening competitive surface. Build plan exists at design §9 + §10.2.
+- **Item 6 — Scored Mode V2 Phase 2 → Phase 3 (Pass D leaderboard), community rollout.** Implementation exists in `sable_roles/features/leaderboard.py` and is registered in `sable_roles/main.py`; no build remains. The ≥10 revealed fits + ≥2 weeks Revealed mode + Brian sign-off criteria remain operator/community rollout decisions (design §9 + §10.2), not code gates; empty guilds receive an empty-board response.
 
 ---
 
@@ -372,6 +391,8 @@ sable_roles/
   main.py                    — SableRolesClient + entrypoint. setup_hook registers fitcheck → roast
                                → vibe_observer (order matters — composes on_message + on_raw_reaction_add);
                                on_ready logs + 24h-empty warning; close() drains debounce + stops vibe cron
+                               setup_hook isolates sync HTTP failures and registers durable duels;
+                               close() stops the duel close loop.
   cli.py                     — operator CLI: backfill_blocklist (R4), grandfather_restoration_tokens (R8)
   config.py                  — env-driven config: token, FITCHECK_CHANNELS, GUILD_TO_ORG, MOD_ROLES,
                                INNER_CIRCLE_*, BURN_*, PEER_ROAST_ROLES (R2), PERSONALIZE_ADMINS (R2),
@@ -401,6 +422,9 @@ sable_roles/
                                /airlock-status (AIRLOCK_TRIAGE_ROLES tier); /add-team-inviter
                                /list-team-inviters (MOD_ROLES team-only); bootstrap(client) for
                                env-seed team-inviters + invite-snapshot first-fetch on on_ready
+    content_duel.py          — persistent _DuelView, message-ID registry lookup, _close_loop +
+                               register / stop_tasks; 24-hour deadlines survive restart.
+    leaderboard.py           — implemented Pass D /leaderboard (two boards + public/window options).
     image_hashing.py         — Scored Mode Pass A: pHash compute + 90d collision detection.
                                compute_phash_and_check_collisions(image_bytes, ctx) runs from
                                fitcheck_streak's image branch regardless of scoring state. Emits
@@ -447,6 +471,9 @@ tests/
   conftest.py                — fitcheck_module fixture + fetch_audit_rows / fetch_streak_rows
   test_image_detection.py / test_dm_bank.py / test_dm_cooldown.py / test_unconfigured_guild.py
   test_handler_resilience.py / test_reaction_recompute.py / test_debounce_race.py
+  test_setup_hook_sync_hardening.py     — per-guild sync HTTP failure isolation (c51f549)
+  test_content_duel.py                  — persistent voting + startup close sweep (16ddb20)
+  test_leaderboard.py                   — Pass D boards, formatting and cooldown
   test_format_streak.py / test_is_mod.py
   test_relax_mode_behavior.py / test_relax_mode_command.py
   test_burn_me_commands.py / test_burn_me_integration.py / test_burn_me_pipeline.py / test_burn_me_state.py
